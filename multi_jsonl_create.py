@@ -15,7 +15,7 @@ MERGE_INTERVAL_MIN  = 5        # если подряд сообщения одн
 SYSTEM_PROMPT       = "Ты — вежливый и полезный ассистент."
 ASSISTANT_NAMES     = {"Vs"}   # имена/ники, считающиеся "assistant"
 MIN_ASSISTANT_CHARS = 5        # минимальная длина последнего ответа ассистента
-KEEP_SHORT_ASSISTANTS = False  # True — короткие ответы идут в train, False — в отдельный файл
+KEEP_SHORT_ASSISTANTS = True  # True — короткие ответы идут в train, False — в отдельный файл
 MIN_MESSAGES_IN_BLOCK = 2      # минимум сообщений в диалоге (после обработки)
 MERGE_ASSISTANT_ALWAYS = True  # сливать подряд идущие assistant-сообщения
                                # даже если интервал > MERGE_INTERVAL_MIN (но внутри блока)
@@ -268,12 +268,13 @@ def generate_jsonl(dialogs_all: list):
                  MIN_ASSISTANT_CHARS, stats["short_assistant_blocks"])
 
     logging.info("Причины отбраковки блоков:")
-    logging.info("  no_assistant       : %d", stats["rule_no_assistant"])
-    logging.info("  too_few_messages   : %d", stats["rule_too_few_messages"])
-    logging.info("  only_one_role      : %d", stats["rule_only_one_role"])
-    logging.info("  empty_block        : %d", stats["rule_empty_block"])
-    logging.info("  other              : %d", stats["rule_other"])
 
+    logging.info("  Нет ответа ассистента (нет пары user→assistant): %d", stats["rule_no_assistant"])
+    logging.info("  Слишком мало сообщений в блоке: %d", stats["rule_too_few_messages"])
+    logging.info("  Только одна роль в блоке (только user или только assistant): %d", stats["rule_only_one_role"])
+    logging.info("  Пустой блок после обработки: %d", stats["rule_empty_block"])
+    logging.info("  Прочие причины: %d", stats["rule_other"])
+    
     logging.info("Блоков с обрезанным user-хвостом (tail_trimmed): %d", stats["tail_trimmed_blocks"])
     logging.info("Количество слияний assistant-сообщений: %d", stats["assistant_merges"])
 

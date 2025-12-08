@@ -411,6 +411,7 @@ def generate_jsonl(dialogs_all: list):
 
 
 def main():
+    global USER_NAME
     dialogs_all = []
     total_msgs = 0
 
@@ -424,6 +425,7 @@ def main():
     for path in files:
         data = load_data(path)
         name = data.get("name") or os.path.basename(path)
+        USER_NAME = name
         msgs = data.get("messages", [])
         total_msgs += len(msgs)
         dialogs = process_chat(msgs)

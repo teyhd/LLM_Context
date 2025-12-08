@@ -1,0 +1,413 @@
+# ───────────────────────────────────────────────────────────────────────
+import os, csv, json, math, random, logging, warnings
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict
+
+import torch
+import torch.serialization
+import numpy.core.multiarray
+
+torch.serialization.add_safe_globals([numpy.core.multiarray._reconstruct])
+
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+    TrainerCallback,
+    EarlyStoppingCallback,
+    TrainerState,
+)
+from peft import LoraConfig, get_peft_model, TaskType
+
+# ─── ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ ────────────────────────────────────────────
+
+MODEL_ID               = "mistralai/Mistral-7B-Instruct-v0.3"
+
+DATA_DIR               = "data/processed"
+TRAIN_FILE             = "train_pass.jsonl"
+VAL_FILE               = "val_pass.jsonl"
+
+OUTPUT_DIR             = "models"
+RUN_NAME               = datetime.now().strftime("mistral-%d.%m-%H.%M")
+# Если хочешь фиксированное имя — раскомментируй:
+# RUN_NAME               = "vlad"
+
+NOTIFY_URL             = "http://home.teyhd.ru:3334/"
+
+NUM_EPOCHS             = 2
+BATCH_SIZE             = 1
+GRAD_ACC               = 8
+LEARNING_RATE          = 1e-5
+
+WARMUP_FRAC            = 0.0
+WEIGHT_DECAY           = 0.01
+MAX_SEQ_LEN            = 2048
+MAX_GRAD_NORM          = 0.0
+
+LORA_R                 = 8
+LORA_ALPHA             = 16
+LORA_DROPOUT           = 0.8
+
+# Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
+TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+SAVE_STEPS             = 500
+EVAL_STEPS             = 500
+SAVE_LIMIT             = 3
+EARLY_PATIENCE         = 5  # реальная ранняя остановка
+
+LOG_STEPS              = 10
+CSV_METRICS            = True
+CSV_FILE               = "metrics.csv"
+LOSS_ALERT             = 7.0
+
+GEN_INTERVAL           = 50
+MAX_GEN_TOKENS         = 128
+TEMPERATURE            = 0.65
+TOP_P                  = 0.8
+
+SEED                   = 42
+
+USE_FP16               = True
+GRADIENT_CHECKPOINTING = True
+REPORT_TO_WANDB        = False
+
+# reproducibility & env
+random.seed(SEED)
+torch.manual_seed(SEED)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# ─── Уведомления ──────────────────────────────────────────────────────
+def notify(msg: str) -> None:
+    if not NOTIFY_URL:
+        return
+    try:
+        import requests
+        requests.get(NOTIFY_URL, params={"msg": f"SRV: {msg[:1000]}"}, timeout=3)
+    except Exception as e:                                     # noqa: BLE001
+        logging.warning(f"notify failed: {e}")
+
+# ─── Логирование ──────────────────────────────────────────────────────
+OUT_DIR = Path(OUTPUT_DIR) / RUN_NAME
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = OUT_DIR / "train.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, "w", "utf-8"), logging.StreamHandler()],
+)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ─── Tokenizer ────────────────────────────────────────────────────────
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=False)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+eos_id = tokenizer.eos_token_id
+
+# ─── Helpers ──────────────────────────────────────────────────────────
+def read_jsonl(path: Path) -> List[Dict]:
+    with path.open(encoding="utf-8") as f:
+        return [json.loads(l) for l in f]
+
+def format_chat(messages: List[Dict]) -> (str, str):
+    """
+    Возвращает:
+      - prompt: все сообщения до последнего assistant (system/user/assistant, размечены тегами)
+      - answer: содержание последнего assistant
+
+    Предполагаем структуру: [system?] ...(диалог)..., assistant(последний).
+    """
+    ass_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+    if not ass_indices:
+        return "", ""
+
+    last_ass_idx = ass_indices[-1]
+    answer = messages[last_ass_idx]["content"].strip()
+    if not answer:
+        return "", ""
+
+    prompt_parts = []
+    for m in messages[:last_ass_idx]:
+        role = m["role"]
+        content = m["content"].strip()
+        if not content:
+            continue
+
+        if role == "system":
+            tag = "system"
+        elif role == "user":
+            tag = "user"
+        else:
+            tag = "assistant"
+
+        prompt_parts.append(f"[{tag}]{content}[/{tag}]")
+
+    prompt = "\n".join(prompt_parts) + "\n[assistant]"
+    return prompt, answer
+
+def build_dataset(raw: List[Dict]) -> Dataset:
+    samples = []
+    for rec in raw:
+        msgs = rec["messages"]
+        # Требуем, чтобы последний в списке был ассистентом
+        if len(msgs) < 2 or msgs[-1]["role"] != "assistant":
+            continue
+
+        prompt, answer = format_chat(msgs)
+        if not prompt or not answer:
+            continue
+
+        prompt_ids = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=MAX_SEQ_LEN // 2,
+            add_special_tokens=False,
+        ).input_ids
+        answer_ids = tokenizer(
+            answer,
+            truncation=True,
+            max_length=MAX_SEQ_LEN // 2,
+            add_special_tokens=False,
+        ).input_ids
+
+        input_ids = prompt_ids + answer_ids + [eos_id]
+        if len(input_ids) > MAX_SEQ_LEN:
+            # Можно логгировать, если нужно понять, что отбрасывается
+            logging.debug("Skipped sample: too long prompt+answer")
+            continue
+
+        labels = [-100] * len(prompt_ids) + answer_ids + [eos_id]
+        samples.append(
+            {
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+            }
+        )
+
+    if not samples:
+        logging.warning("⚠️ build_dataset: no valid samples constructed")
+        return Dataset.from_list([])
+
+    return Dataset.from_list(samples).with_format("torch")
+
+# ─── Data ─────────────────────────────────────────────────────────────
+train_raw = read_jsonl(Path(DATA_DIR) / TRAIN_FILE)
+val_raw   = read_jsonl(Path(DATA_DIR) / VAL_FILE)
+
+train_ds  = build_dataset(train_raw)
+val_ds    = build_dataset(val_raw)
+
+logging.info(f"📊 samples → {len(train_ds)} train • {len(val_ds)} val")
+
+# ─── Model + LoRA ─────────────────────────────────────────────────────
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.float16 if USE_FP16 else torch.float32,
+    device_map="auto",
+)
+base_model.resize_token_embeddings(len(tokenizer))
+base_model.config.use_cache = False
+if GRADIENT_CHECKPOINTING:
+    base_model.gradient_checkpointing_enable()
+
+lora_cfg = LoraConfig(
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=LORA_DROPOUT,
+    target_modules=TARGET_MODULES,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+model = get_peft_model(base_model, lora_cfg)
+model.print_trainable_parameters()
+
+# ─── Callbacks ────────────────────────────────────────────────────────
+class CSVLogger(TrainerCallback):
+    def __init__(self):
+        self.header = False
+
+    def on_log(self, args, state, control, logs=None, **kw):
+        if not CSV_METRICS or not logs:
+            return
+        csv_path = OUT_DIR / CSV_FILE
+        write_header = not csv_path.exists()
+        with csv_path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["step"] + list(logs))
+            if write_header:
+                w.writeheader()
+            w.writerow({"step": state.global_step, **logs})
+        if logs.get("loss", 0) > LOSS_ALERT:
+            notify(f"⚠️ loss {state.global_step}: {logs['loss']:.2f}")
+
+class SaveAdapter(TrainerCallback):
+    def on_save(self, args, state, control, **kw):
+        p = Path(args.output_dir) / f"checkpoint-{state.global_step}" / "adapter"
+        p.mkdir(parents=True, exist_ok=True)
+        kw["model"].save_pretrained(p)
+        logging.info(f"💾 adapter saved at step {state.global_step}")
+        notify(f"💾 checkpoint {state.global_step}")
+
+class StartEndNotify(TrainerCallback):
+    def on_train_begin(self, *a, **kw):
+        notify("🚀 Старт обучения")
+
+    def on_train_end(self, *a, **kw):
+        notify("✅ Обучение завершено")
+
+    def on_evaluate(self, args, state, control, metrics=None, **kw):
+        if metrics and "eval_loss" in metrics:
+            notify(f"📉 eval {state.global_step}: {metrics['eval_loss']:.4f}")
+
+class RandomGenerateNotify(TrainerCallback):
+    def __init__(self, data: List[Dict], interval: int = GEN_INTERVAL):
+        self.data = data
+        self.interval = interval
+
+    def safe_generate(self, prompt_ids: torch.Tensor) -> str:
+        try:
+            if prompt_ids.numel() == 0:
+                return "[SKIP: empty prompt]"
+
+            prompt_ids = prompt_ids.to(model.device)
+            model.eval()
+
+            with torch.no_grad():
+                out = model.generate(
+                    prompt_ids,
+                    max_new_tokens=MAX_GEN_TOKENS,
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    pad_token_id=eos_id,
+                    eos_token_id=eos_id,
+                    do_sample=True,
+                )
+
+            return tokenizer.decode(
+                out[0][prompt_ids.shape[-1]:],
+                skip_special_tokens=True,
+            )
+
+        except RuntimeError as e:
+            if "CUDA error" in str(e) or "device-side assert" in str(e):
+                logging.warning(f"[GEN FAIL] CUDA error: {e}")
+                notify(f"⚠️ Ошибка генерации: {e}")
+                return "[GENERATION FAILED]"
+            raise
+
+    def on_step_end(self, args, state: TrainerState, control, **kwargs):
+        if state.global_step == 0 or state.global_step % self.interval != 0:
+            return
+
+        rec = random.choice(self.data)
+        prompt, gold = format_chat(rec["messages"])
+        if not prompt:
+            return
+
+        prompt_ids = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+        ).input_ids
+
+        gen = self.safe_generate(prompt_ids)
+        notify(f"🎙 {state.global_step}\nPROMPT: {prompt}\nQ: {gold}\nGEN: {gen}")
+
+# ─── TrainingArguments ───────────────────────────────────────────────
+updates = math.ceil(len(train_ds) / BATCH_SIZE / GRAD_ACC) * NUM_EPOCHS if len(train_ds) > 0 else 0
+warmup  = max(10, int(updates * WARMUP_FRAC)) if updates > 0 else 0
+
+args = TrainingArguments(
+    output_dir=str(OUT_DIR),
+    run_name=RUN_NAME,
+    seed=SEED,
+
+    num_train_epochs=NUM_EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=1,
+    gradient_accumulation_steps=GRAD_ACC,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    warmup_steps=warmup,
+    lr_scheduler_type="cosine",
+
+    fp16=USE_FP16,
+    max_grad_norm=MAX_GRAD_NORM,
+
+    logging_steps=LOG_STEPS,
+
+    evaluation_strategy="steps",        # ← важно
+    eval_steps=EVAL_STEPS,
+
+    save_strategy="steps",
+    save_steps=SAVE_STEPS,
+    save_total_limit=SAVE_LIMIT,
+    load_best_model_at_end=True,
+
+    optim="adamw_torch_fused",
+    report_to=[] if not REPORT_TO_WANDB else ["wandb"],
+    save_safetensors=True,
+)
+
+# ─── Data Collator ───────────────────────────────────────────────────
+def collate(batch):
+    pad_id = tokenizer.pad_token_id
+    input_ids      = torch.nn.utils.rnn.pad_sequence(
+        [x["input_ids"] for x in batch], batch_first=True, padding_value=pad_id
+    )
+    attention_mask = torch.nn.utils.rnn.pad_sequence(
+        [x["attention_mask"] for x in batch], batch_first=True, padding_value=0
+    )
+    labels         = torch.nn.utils.rnn.pad_sequence(
+        [x["labels"] for x in batch], batch_first=True, padding_value=-100
+    )
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+# ─── Trainer ─────────────────────────────────────────────────────────
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    data_collator=collate,
+    callbacks=[
+        CSVLogger(),
+        SaveAdapter(),
+        StartEndNotify(),
+        RandomGenerateNotify(train_raw),
+        EarlyStoppingCallback(early_stopping_patience=EARLY_PATIENCE),
+    ],
+)
+
+# ─── Run ─────────────────────────────────────────────────────────────
+ckpts = sorted(
+    OUT_DIR.glob("checkpoint-*"),
+    key=lambda p: int(p.name.split("-")[-1]),
+)
+resume_ckpt = str(ckpts[-1]) if ckpts else None
+if resume_ckpt and not Path(resume_ckpt).exists():
+    resume_ckpt = None
+
+notify(f"🔄 Resume {resume_ckpt}" if resume_ckpt else "🔥 New run")
+trainer.train(resume_from_checkpoint=resume_ckpt)
+
+# ─── Save final adapter ──────────────────────────────────────────────
+adapter_dir = OUT_DIR / "final_adapter"
+model.save_pretrained(adapter_dir)
+tokenizer.save_pretrained(adapter_dir)
+logging.info(f"Adapter saved to {adapter_dir}")
+notify("🎉 Финальный адаптер сохранён")

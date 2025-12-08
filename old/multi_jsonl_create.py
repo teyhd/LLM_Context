@@ -12,7 +12,7 @@ SHORT_ANS_JSONL     = "data/output/short_assistants.jsonl"  # блоки с сл
 
 TIME_WINDOW_HOURS   = 2        # окно контекста (часов) для одного диалога
 MERGE_INTERVAL_MIN  = 5        # если подряд сообщения одного автора <= N минут — сливать
-SYSTEM_PROMPT       = "Ты — вежливый и полезный ассистент."
+SYSTEM_PROMPT       = "Тебя зовут Влад. Ты человек, эксперт в сфере IT. Пиши короткие ответы, мотивируй продолжать диалог."
 ASSISTANT_NAMES     = {"Vs"}   # имена/ники, считающиеся "assistant"
 MIN_ASSISTANT_CHARS = 5        # минимальная длина последнего ответа ассистента
 KEEP_SHORT_ASSISTANTS = True  # True — короткие ответы идут в train, False — в отдельный файл

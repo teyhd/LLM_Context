@@ -26,14 +26,13 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 MODEL_ID               = "mistralai/Mistral-7B-Instruct-v0.3"
 
-DATA_DIR               = "data/processed"
-TRAIN_FILE             = "train_pass.jsonl"
-VAL_FILE               = "val_pass.jsonl"
+DATA_DIR               = "data/output"
+TRAIN_FILE             = "train.jsonl"
+VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
-RUN_NAME               = datetime.now().strftime("mistral-%d.%m-%H.%M")
-# Если хочешь фиксированное имя — раскомментируй:
-# RUN_NAME               = "vlad"
+# фиксированное имя прогона, совпадает с ботом
+RUN_NAME               = "vlad"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
@@ -47,30 +46,30 @@ WEIGHT_DECAY           = 0.01
 MAX_SEQ_LEN            = 2048
 MAX_GRAD_NORM          = 0.0
 
-LORA_R                 = 8
-LORA_ALPHA             = 16
-LORA_DROPOUT           = 0.8
+LORA_R                 = 32#8
+LORA_ALPHA             = 64#16
+LORA_DROPOUT           = 0.14
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
+   "q_proj",
+  #  "k_proj",
+   "v_proj",
     "o_proj",
     "gate_proj",
-    "up_proj",
-    "down_proj",
+  #  "up_proj",
+  #  "down_proj",
 ]
 
 SAVE_STEPS             = 500
-EVAL_STEPS             = 500
+EVAL_STEPS             = 100
 SAVE_LIMIT             = 3
-EARLY_PATIENCE         = 5  # реальная ранняя остановка
+EARLY_PATIENCE         = 15  # реальная ранняя остановка
 
 LOG_STEPS              = 10
 CSV_METRICS            = True
 CSV_FILE               = "metrics.csv"
-LOSS_ALERT             = 7.0
+LOSS_ALERT             = 5.0
 
 GEN_INTERVAL           = 50
 MAX_GEN_TOKENS         = 128
@@ -95,6 +94,7 @@ def notify(msg: str) -> None:
         return
     try:
         import requests
+        print(msg)
         requests.get(NOTIFY_URL, params={"msg": f"SRV: {msg[:1000]}"}, timeout=3)
     except Exception as e:                                     # noqa: BLE001
         logging.warning(f"notify failed: {e}")
@@ -325,7 +325,7 @@ class RandomGenerateNotify(TrainerCallback):
         ).input_ids
 
         gen = self.safe_generate(prompt_ids)
-        notify(f"🎙 {state.global_step}\nPROMPT: {prompt}\nQ: {gold}\nGEN: {gen}")
+        notify(f"🎙 {state.global_step}\nGEN: {gen}\nPROMPT: {prompt}\nQ: {gold}")
 
 # ─── TrainingArguments ───────────────────────────────────────────────
 updates = math.ceil(len(train_ds) / BATCH_SIZE / GRAD_ACC) * NUM_EPOCHS if len(train_ds) > 0 else 0
@@ -350,10 +350,10 @@ args = TrainingArguments(
 
     logging_steps=LOG_STEPS,
 
-    evaluation_strategy="steps",        # ← важно
+    evaluation_strategy="epoch",
     eval_steps=EVAL_STEPS,
 
-    save_strategy="steps",
+    save_strategy="epoch",
     save_steps=SAVE_STEPS,
     save_total_limit=SAVE_LIMIT,
     load_best_model_at_end=True,
@@ -402,7 +402,7 @@ resume_ckpt = str(ckpts[-1]) if ckpts else None
 if resume_ckpt and not Path(resume_ckpt).exists():
     resume_ckpt = None
 
-notify(f"🔄 Resume {resume_ckpt}" if resume_ckpt else "🔥 New run")
+notify(f"Resume {resume_ckpt}" if resume_ckpt else "New run")
 trainer.train(resume_from_checkpoint=resume_ckpt)
 
 # ─── Save final adapter ──────────────────────────────────────────────

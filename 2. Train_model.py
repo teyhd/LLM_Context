@@ -350,7 +350,7 @@ args = TrainingArguments(
 
     logging_steps=LOG_STEPS,
 
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     eval_steps=EVAL_STEPS,
 
     save_strategy="epoch",

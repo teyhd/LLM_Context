@@ -179,21 +179,28 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
     if not chat_ctx:
         return "История пуста, отправьте сообщение ещё раз."
 
-    prompt = tokenizer.apply_chat_template(
+    # Строим prompt как в обучении и вручную обрезаем историю справа, чтобы не терять свежий контекст
+    prompt_text = tokenizer.apply_chat_template(
         chat_ctx,
         tokenize=False,
         add_generation_prompt=True,
     )
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_CONTEXT_TOKENS,
-    ).to(model.device)
-    prompt_tokens = inputs.input_ids.shape[1]
-    log_context(user_id, who, history, prompt, prompt_tokens)
+    prompt_ids = tokenizer(
+        prompt_text,
+        add_special_tokens=False,
+    ).input_ids
+    if len(prompt_ids) > MAX_CONTEXT_TOKENS:
+        prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
+    inputs = {
+        "input_ids": torch.tensor([prompt_ids], device=model.device),
+        "attention_mask": torch.ones(1, len(prompt_ids), device=model.device),
+    }
+    log_context(user_id, who, history, prompt_text, len(prompt_ids))
+
     output_ids = model.generate(**inputs, generation_config=GEN_CFG)[0]
-    answer_ids = output_ids[inputs.input_ids.shape[1]:]
+    answer_ids = output_ids[len(prompt_ids):]
     answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
     DIALOGS[user_id].append({"role": "assistant", "content": answer})
     trim_history(user_id)

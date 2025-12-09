@@ -61,8 +61,8 @@ TARGET_MODULES = [
   #  "down_proj",
 ]
 
-SAVE_STEPS             = 100
-EVAL_STEPS             = 100
+SAVE_STEPS             = 50
+EVAL_STEPS             = 50
 SAVE_LIMIT             = 3
 EARLY_PATIENCE         = 30  # реальная ранняя остановка
 
@@ -71,7 +71,7 @@ CSV_METRICS            = True
 CSV_FILE               = "metrics.csv"
 LOSS_ALERT             = 5.0
 
-GEN_INTERVAL           = 50
+GEN_INTERVAL           = 25
 MAX_GEN_TOKENS         = 128
 TEMPERATURE            = 0.65
 TOP_P                  = 0.8
@@ -202,30 +202,54 @@ def build_dataset(raw: List[Dict]) -> Dataset:
         prompt_ids = tokenizer(
             prompt,
             truncation=True,
-            max_length=MAX_SEQ_LEN // 2,
+            max_length=MAX_SEQ_LEN,
             add_special_tokens=False,
         ).input_ids
         answer_ids = tokenizer(
             answer,
             truncation=True,
-            max_length=MAX_SEQ_LEN // 2,
+            max_length=MAX_SEQ_LEN,
             add_special_tokens=False,
         ).input_ids
 
-        input_ids = prompt_ids + answer_ids + [eos_id]
-        if len(input_ids) > MAX_SEQ_LEN:
-            # Можно логгировать, если нужно понять, что отбрасывается
-            logging.debug("Skipped sample: too long prompt+answer")
-            continue
+        max_prompt_len = MAX_SEQ_LEN - len(answer_ids) - 1
+        if max_prompt_len <= 0:
+            # Ответ сам по себе больше лимита — режем его, чтобы не терять выборку
+            answer_ids = answer_ids[: MAX_SEQ_LEN - 1]
+            max_prompt_len = 0
 
-        labels = [-100] * len(prompt_ids) + answer_ids + [eos_id]
-        samples.append(
-            {
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
-                "labels": torch.tensor(labels, dtype=torch.long),
-            }
-        )
+        # Разбиваем длинный prompt на окна, чтобы не терять контекст
+        prompt_chunks = []
+        if not prompt_ids:
+            prompt_chunks = [[]]
+        elif len(prompt_ids) <= max_prompt_len or max_prompt_len == 0:
+            prompt_chunks = [prompt_ids[-max_prompt_len:]]  # последняя часть или пусто
+        else:
+            stride = max(max_prompt_len // 2, 1)
+            n = len(prompt_ids)
+            start = 0
+            while start < n:
+                chunk = prompt_ids[start:start + max_prompt_len]
+                prompt_chunks.append(chunk)
+                if start + max_prompt_len >= n:
+                    break
+                start += stride
+            tail = prompt_ids[-max_prompt_len:]
+            if prompt_chunks and prompt_chunks[-1] != tail:
+                prompt_chunks.append(tail)
+
+        for chunk in prompt_chunks:
+            input_ids = chunk + answer_ids + [eos_id]
+            if len(input_ids) > MAX_SEQ_LEN:
+                continue
+            labels = [-100] * len(chunk) + answer_ids + [eos_id]
+            samples.append(
+                {
+                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                    "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+                    "labels": torch.tensor(labels, dtype=torch.long),
+                }
+            )
 
     if not samples:
         logging.warning("⚠️ build_dataset: no valid samples constructed")

@@ -37,7 +37,7 @@ RUN_NAME               = "vlad"
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
 NUM_EPOCHS             = 2
-BATCH_SIZE             = 2
+BATCH_SIZE             = 1
 GRAD_ACC               = 8
 LEARNING_RATE          = 1e-5
 
@@ -46,35 +46,35 @@ WEIGHT_DECAY           = 0.01
 MAX_SEQ_LEN            = 2048
 MAX_GRAD_NORM          = 0.0
 
-LORA_R                 = 256#8
+LORA_R                 = 128#8
 LORA_ALPHA             = 256#16
 LORA_DROPOUT           = 0.15
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
-   # "qkv_proj",
-   # "k_proj",
-   # "v_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
     "o_proj",
     "gate_proj",
-  #  "up_proj",
-  #  "down_proj",
+    "up_proj",
+    "down_proj",
 ]
 
-SAVE_STEPS             = 50
-EVAL_STEPS             = 50
+SAVE_STEPS             = 25
+EVAL_STEPS             = 25
 SAVE_LIMIT             = 3
 EARLY_PATIENCE         = 30  # реальная ранняя остановка
 
-LOG_STEPS              = 10
+LOG_STEPS              = 5
 CSV_METRICS            = True
 CSV_FILE               = "metrics.csv"
 LOSS_ALERT             = 5.0
 
-GEN_INTERVAL           = 25
+GEN_INTERVAL           = 10
 MAX_GEN_TOKENS         = 128
-TEMPERATURE            = 0.65
-TOP_P                  = 0.8
+TEMPERATURE            = 0.4
+TOP_P                  = 0.7
 
 ANALYTICS_STEPS        = 5  # шаги, через которые шлём короткую сводку
 
@@ -344,8 +344,15 @@ class RandomGenerateNotify(TrainerCallback):
         self.data = data
         self.interval = interval
 
-    def safe_generate(self, prompt_ids: torch.Tensor) -> str:
+    def safe_generate(self, prompt_text: str) -> str:
         try:
+            enc = tokenizer(
+                prompt_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=MAX_SEQ_LEN,
+            )
+            prompt_ids = enc.input_ids
             if prompt_ids.numel() == 0:
                 return "[SKIP: empty prompt]"
 
@@ -384,15 +391,17 @@ class RandomGenerateNotify(TrainerCallback):
         if not prompt:
             return
 
-        prompt_ids = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-        ).input_ids
+        # Берём последний user перед ответом для отчёта
+        last_user = ""
+        for m in reversed(rec["messages"]):
+            if m.get("role") == "user":
+                last_user = m.get("content", "").strip()
+                break
 
-        gen = self.safe_generate(prompt_ids)
-        notify(f"🎙 {state.global_step}\nGEN: {gen}\nPROMPT: {prompt}\nQ: {gold}")
+        gen = self.safe_generate(prompt)
+        notify(
+            f"🎙 {state.global_step}\nUSER: {last_user}\nGOLD: {gold}\nGEN: {gen}\nPROMPT: {prompt}"
+        )
 
 # ─── TrainingArguments ───────────────────────────────────────────────
 updates = math.ceil(len(train_ds) / BATCH_SIZE / GRAD_ACC) * NUM_EPOCHS if len(train_ds) > 0 else 0
@@ -417,10 +426,10 @@ args = TrainingArguments(
 
     logging_steps=LOG_STEPS,
 
-    eval_strategy="epoch",
+    eval_strategy="steps",
     eval_steps=EVAL_STEPS,
 
-    save_strategy="epoch",
+    save_strategy="steps",
     save_steps=SAVE_STEPS,
     save_total_limit=SAVE_LIMIT,
     load_best_model_at_end=True,

@@ -46,15 +46,15 @@ WEIGHT_DECAY           = 0.01
 MAX_SEQ_LEN            = 2048
 MAX_GRAD_NORM          = 0.0
 
-LORA_R                 = 32#8
-LORA_ALPHA             = 64#16
+LORA_R                 = 256#8
+LORA_ALPHA             = 256#16
 LORA_DROPOUT           = 0.15
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
+   # "q_proj",
+   # "k_proj",
+   # "v_proj",
     "o_proj",
     "gate_proj",
   #  "up_proj",
@@ -64,7 +64,7 @@ TARGET_MODULES = [
 SAVE_STEPS             = 500
 EVAL_STEPS             = 100
 SAVE_LIMIT             = 3
-EARLY_PATIENCE         = 15  # реальная ранняя остановка
+EARLY_PATIENCE         = 30  # реальная ранняя остановка
 
 LOG_STEPS              = 10
 CSV_METRICS            = True

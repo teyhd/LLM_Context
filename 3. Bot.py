@@ -17,7 +17,7 @@ from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizati
 # ──────────────────────── Константы ─────────────────────────
 BASE_MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.3"
 
-LORA_ADAPTER_DIR  = "models/vlad/final_adapter"
+LORA_ADAPTER_DIR  = "models/vlad2/final_adapter"
 
 SYSTEM_PROMPT    = "Тебя зовут Влад. Ты человек, эксперт в сфере IT. Пиши короткие ответы, мотивируй продолжать диалог."
 USER_INSTRUCTION_TEMPLATE = "Имя пользователя: {who}. Напиши ответ на сообщение: {text}"
@@ -31,9 +31,9 @@ DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE             = torch.float16 if DEVICE == "cuda" else torch.float32
 
 MAX_NEW_TOKENS    = 128  
-TEMPERATURE            = 0.7
-TOP_P                  = 0.8        
-WHOO = "Наталья Соина"
+TEMPERATURE       = 0.65
+TOP_P             = 0.8        
+WHOO = "Алиса Юрьевна"
 
 LOG_FILE = "bot.log"
 logging.basicConfig(

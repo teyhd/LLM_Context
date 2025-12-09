@@ -76,6 +76,8 @@ MAX_GEN_TOKENS         = 128
 TEMPERATURE            = 0.65
 TOP_P                  = 0.8
 
+ANALYTICS_STEPS        = 100  # шаги, через которые шлём короткую сводку
+
 SEED                   = 42
 
 USE_FP16               = True
@@ -240,7 +242,7 @@ class CSVLogger(TrainerCallback):
     def __init__(self):
         self.header = False
 
-    def on_log(self, args, state, control, logs=None, **kw):
+def on_log(self, args, state, control, logs=None, **kw):
         if not CSV_METRICS or not logs:
             return
         csv_path = OUT_DIR / CSV_FILE
@@ -252,6 +254,20 @@ class CSVLogger(TrainerCallback):
             w.writerow({"step": state.global_step, **logs})
         if logs.get("loss", 0) > LOSS_ALERT:
             notify(f"⚠️ loss {state.global_step}: {logs['loss']:.2f}")
+        if state.global_step and state.global_step % ANALYTICS_STEPS == 0:
+            loss = logs.get("loss")
+            eval_loss = logs.get("eval_loss")
+            lr = logs.get("learning_rate")
+            parts = [f"step {state.global_step}"]
+            if loss is not None:
+                parts.append(f"loss={loss:.3f}")
+            if eval_loss is not None:
+                parts.append(f"eval={eval_loss:.3f}")
+            if lr is not None:
+                parts.append(f"lr={lr:.2e}")
+            msg = " | ".join(parts)
+            logging.info(msg)
+            notify(msg)
 
 class SaveAdapter(TrainerCallback):
     def on_save(self, args, state, control, **kw):

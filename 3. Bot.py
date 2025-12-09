@@ -107,13 +107,21 @@ def trim_history(uid: int) -> list[dict]:
     DIALOGS[uid] = history
     return history
 
-def build_prompt(current_user_text: str, who: str) -> str:
-    """Форматирует запрос так же, как в тренировочном датасете."""
-    user_text = USER_INSTRUCTION_TEMPLATE.format(who=who, text=current_user_text)
-    parts = [
-        f"[system]{SYSTEM_PROMPT}[/system]",
-        f"[user]{user_text}[/user]",
-    ]
+def build_prompt(messages: list[dict], who: str) -> str:
+    """Формируем prompt из всей истории (как в датасете: system + user-инструкция + assistant)."""
+    parts = []
+    for m in messages:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "system":
+            parts.append(f"[system]{content}[/system]")
+        elif role == "user":
+            user_text = USER_INSTRUCTION_TEMPLATE.format(who=who, text=content)
+            parts.append(f"[user]{user_text}[/user]")
+        else:
+            parts.append(f"[assistant]{content}[/assistant]")
     return "\n".join(parts) + "\n[assistant]"
 
 @torch.inference_mode()
@@ -121,8 +129,8 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
     if user_id not in DIALOGS:
         reset_dialog(user_id)
     DIALOGS[user_id].append({"role": "user", "content": text})
-    trim_history(user_id)
-    prompt = build_prompt(text, who)
+    history = trim_history(user_id)
+    prompt = build_prompt(history, who)
     inputs = tokenizer(
         prompt,
         return_tensors="pt",

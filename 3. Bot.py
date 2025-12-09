@@ -17,10 +17,10 @@ from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizati
 # ──────────────────────── Константы ─────────────────────────
 BASE_MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.3"
 
-LORA_ADAPTER_DIR  = "models/vlad2/final_adapter"
+LORA_ADAPTER_DIR  = "models/vlad/final_adapter"
 
-SYSTEM_PROMPT    = "Тебя зовут Влад. Ты человек, эксперт в сфере IT. Пиши короткие ответы, мотивируй продолжать диалог."
-USER_INSTRUCTION_TEMPLATE = "Имя пользователя: {who}. Напиши ответ на сообщение: {text}"
+SYSTEM_PROMPT    = "Ты дружелюбный и лаконичный помощник.\nГлавный фокус — переписки и вопросы по IT: отвечай по делу, без лишней воды."
+USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
 MAX_CONTEXT_TOKENS = 2048
 MAX_HISTORY_MESSAGES = 40
 ADMIN_ID          = 304622290
@@ -31,9 +31,9 @@ DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE             = torch.float16 if DEVICE == "cuda" else torch.float32
 
 MAX_NEW_TOKENS    = 128  
-TEMPERATURE       = 0.65
+TEMPERATURE       = 0.5
 TOP_P             = 0.8        
-WHOO = "Алиса Юрьевна"
+WHOO = "Без имени"
 
 LOG_FILE = "bot.log"
 logging.basicConfig(
@@ -85,7 +85,12 @@ base_model = AutoModelForCausalLM.from_pretrained(
 base_model.resize_token_embeddings(len(tokenizer))          # safety
 
 print("Подключаю LoRA-адаптер…")
-model = PeftModel.from_pretrained(base_model, LORA_ADAPTER_DIR)
+model = PeftModel.from_pretrained(
+    base_model,
+    LORA_ADAPTER_DIR,
+    torch_dtype=DTYPE,
+    device_map={"": DEVICE},
+)
 #model = base_model
 model.eval()
 

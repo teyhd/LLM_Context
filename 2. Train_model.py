@@ -32,39 +32,39 @@ VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
 # фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad"
+RUN_NAME               = "vlad2"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
-NUM_EPOCHS             = 2
-BATCH_SIZE             = 1
-GRAD_ACC               = 8
-LEARNING_RATE          = 1e-5
+NUM_EPOCHS             = 3
+BATCH_SIZE             = 2
+GRAD_ACC               = 4
+LEARNING_RATE          = 5e-5
 
-WARMUP_FRAC            = 0.0
+WARMUP_FRAC            = 0.05
 WEIGHT_DECAY           = 0.01
 MAX_SEQ_LEN            = 2048
-MAX_GRAD_NORM          = 0.0
+MAX_GRAD_NORM          = 0.3
 
-LORA_R                 = 128#8
-LORA_ALPHA             = 256#16
-LORA_DROPOUT           = 0.15
+LORA_R                 = 16#8
+LORA_ALPHA             = 32#16
+LORA_DROPOUT           = 0.2
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
     "q_proj",
-    "k_proj",
-    "v_proj",
+   # "k_proj",
+   # "v_proj",
     "o_proj",
     "gate_proj",
-    "up_proj",
-    "down_proj",
+   # "up_proj",
+   # "down_proj",
 ]
 
 SAVE_STEPS             = 25
 EVAL_STEPS             = 25
 SAVE_LIMIT             = 3
-EARLY_PATIENCE         = 30  # реальная ранняя остановка
+EARLY_PATIENCE         = 8   # реальная ранняя остановка
 
 LOG_STEPS              = 5
 CSV_METRICS            = True
@@ -81,6 +81,7 @@ ANALYTICS_STEPS        = 5  # шаги, через которые шлём ко�
 SEED                   = 42
 
 USE_FP16               = True
+USE_BF16               = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 GRADIENT_CHECKPOINTING = True
 REPORT_TO_WANDB        = False
 
@@ -216,27 +217,27 @@ def build_dataset(raw: List[Dict]) -> Dataset:
         if max_prompt_len <= 0:
             # Ответ сам по себе больше лимита — режем его, чтобы не терять выборку
             answer_ids = answer_ids[: MAX_SEQ_LEN - 1]
-            max_prompt_len = 0
-
-        # Разбиваем длинный prompt на окна, чтобы не терять контекст
-        prompt_chunks = []
-        if not prompt_ids:
             prompt_chunks = [[]]
-        elif len(prompt_ids) <= max_prompt_len or max_prompt_len == 0:
-            prompt_chunks = [prompt_ids[-max_prompt_len:]]  # последняя часть или пусто
         else:
-            stride = max(max_prompt_len // 2, 1)
-            n = len(prompt_ids)
-            start = 0
-            while start < n:
-                chunk = prompt_ids[start:start + max_prompt_len]
-                prompt_chunks.append(chunk)
-                if start + max_prompt_len >= n:
-                    break
-                start += stride
-            tail = prompt_ids[-max_prompt_len:]
-            if prompt_chunks and prompt_chunks[-1] != tail:
-                prompt_chunks.append(tail)
+            # Разбиваем длинный prompt на окна, чтобы не терять контекст
+            prompt_chunks = []
+            if not prompt_ids:
+                prompt_chunks = [[]]
+            elif len(prompt_ids) <= max_prompt_len:
+                prompt_chunks = [prompt_ids]
+            else:
+                stride = max(max_prompt_len // 2, 1)
+                n = len(prompt_ids)
+                start = 0
+                while start < n:
+                    chunk = prompt_ids[start:start + max_prompt_len]
+                    prompt_chunks.append(chunk)
+                    if start + max_prompt_len >= n:
+                        break
+                    start += stride
+                tail = prompt_ids[-max_prompt_len:]
+                if prompt_chunks and prompt_chunks[-1] != tail:
+                    prompt_chunks.append(tail)
 
         for chunk in prompt_chunks:
             input_ids = chunk + answer_ids + [eos_id]
@@ -269,7 +270,7 @@ logging.info(f"📊 samples → {len(train_ds)} train • {len(val_ds)} val")
 # ─── Model + LoRA ─────────────────────────────────────────────────────
 base_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float16 if USE_FP16 else torch.float32,
+    torch_dtype=torch.bfloat16 if USE_BF16 else (torch.float16 if USE_FP16 else torch.float32),
     device_map="auto",
 )
 base_model.resize_token_embeddings(len(tokenizer))
@@ -291,18 +292,40 @@ model.print_trainable_parameters()
 # ─── Callbacks ────────────────────────────────────────────────────────
 class CSVLogger(TrainerCallback):
     def __init__(self):
-        self.header = False
+        self.columns = ["step"]
+        self.header_written = False
+
+    def _read_existing_header(self, csv_path: Path) -> None:
+        if self.header_written or not csv_path.exists():
+            return
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as f:
+                header = next(csv.reader(f), None)
+            if header:
+                self.columns = list(header)
+                self.header_written = True
+        except Exception as e:  # noqa: BLE001
+            logging.warning("csv header read failed: %s", e)
 
     def on_log(self, args, state, control, logs=None, **kw):
         if not CSV_METRICS or not logs:
             return
         csv_path = OUT_DIR / CSV_FILE
-        write_header = not csv_path.exists()
+        self._read_existing_header(csv_path)
+        for key in logs:
+            if key not in self.columns:
+                self.columns.append(key)
         with csv_path.open("a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["step"] + list(logs))
-            if write_header:
+            w = csv.DictWriter(f, fieldnames=self.columns)
+            if not self.header_written:
                 w.writeheader()
-            w.writerow({"step": state.global_step, **logs})
+                self.header_written = True
+            row = {"step": state.global_step}
+            for key in self.columns:
+                if key == "step":
+                    continue
+                row[key] = logs.get(key)
+            w.writerow(row)
         if logs.get("loss", 0) > LOSS_ALERT:
             notify(f"⚠️ loss {state.global_step}: {logs['loss']:.2f}")
         if state.global_step and state.global_step % ANALYTICS_STEPS == 0:
@@ -353,15 +376,18 @@ class RandomGenerateNotify(TrainerCallback):
                 max_length=MAX_SEQ_LEN,
             )
             prompt_ids = enc.input_ids
+            attn_mask = enc.attention_mask
             if prompt_ids.numel() == 0:
                 return "[SKIP: empty prompt]"
 
             prompt_ids = prompt_ids.to(model.device)
+            attn_mask = attn_mask.to(model.device)
             model.eval()
 
             with torch.no_grad():
                 out = model.generate(
                     prompt_ids,
+                    attention_mask=attn_mask,
                     max_new_tokens=MAX_GEN_TOKENS,
                     temperature=TEMPERATURE,
                     top_p=TOP_P,
@@ -414,14 +440,15 @@ args = TrainingArguments(
 
     num_train_epochs=NUM_EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=1,
+    per_device_eval_batch_size=2,
     gradient_accumulation_steps=GRAD_ACC,
     learning_rate=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
     warmup_steps=warmup,
     lr_scheduler_type="cosine",
 
-    fp16=USE_FP16,
+    fp16=USE_FP16 and not USE_BF16,
+    bf16=USE_BF16,
     max_grad_norm=MAX_GRAD_NORM,
 
     logging_steps=LOG_STEPS,
@@ -433,6 +460,8 @@ args = TrainingArguments(
     save_steps=SAVE_STEPS,
     save_total_limit=SAVE_LIMIT,
     load_best_model_at_end=True,
+    group_by_length=True,
+    eval_accumulation_steps=4,
 
     optim="adamw_torch_fused",
     report_to=[] if not REPORT_TO_WANDB else ["wandb"],

@@ -2,6 +2,7 @@ import os
 import gc
 import psutil
 import random
+import logging
 import datetime as dt
 from pathlib import Path
 
@@ -33,6 +34,16 @@ MAX_NEW_TOKENS    = 128
 TEMPERATURE            = 0.7
 TOP_P                  = 0.8        
 WHOO = "Наталья Соина"
+
+LOG_FILE = "bot.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, "a", "utf-8"),
+        logging.StreamHandler(),
+    ],
+)
 
 # ─────────────────────── Помощники ──────────────────────────
 def ram_mb() -> float:
@@ -124,6 +135,16 @@ def build_prompt(messages: list[dict], who: str) -> str:
             parts.append(f"[assistant]{content}[/assistant]")
     return "\n".join(parts) + "\n[assistant]"
 
+def log_context(uid: int, who: str, history: list[dict], prompt: str, prompt_tokens: int) -> None:
+    """Логируем весь контекст перед генерацией, чтобы видеть, что ушло в модель."""
+    try:
+        logging.info(
+            "CTX uid=%s who=%s msgs=%d prompt_tokens=%d\n%s",
+            uid, who, len(history), prompt_tokens, prompt,
+        )
+    except Exception as e:  # noqa: BLE001
+        logging.warning("log_context failed: %s", e)
+
 @torch.inference_mode()
 def llm_answer(user_id: int, text: str, who: str) -> str:
     if user_id not in DIALOGS:
@@ -137,11 +158,14 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
         truncation=True,
         max_length=MAX_CONTEXT_TOKENS,
     ).to(model.device)
+    prompt_tokens = inputs.input_ids.shape[1]
+    log_context(user_id, who, history, prompt, prompt_tokens)
     output_ids = model.generate(**inputs, generation_config=GEN_CFG)[0]
     answer_ids = output_ids[inputs.input_ids.shape[1]:]
     answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
     DIALOGS[user_id].append({"role": "assistant", "content": answer})
     trim_history(user_id)
+    logging.info("ANSWER uid=%s len=%d text=%s", user_id, len(answer), answer)
     return answer
 
 # ──────────────── Обработчики команд ────────────────────────
@@ -194,17 +218,17 @@ def handle_text(msg):
    # print(msg)
     uid = msg.from_user.id
     who = WHOO or msg.from_user.first_name or "user"
-    print(f"[{uid}:{who}]\n{msg.text}")
+    logging.info("IN uid=%s who=%s text=%s", uid, who, msg.text)
     #if uid != ADMIN_ID:
        # bot.reply_to(msg, "Бот доступен только владельцу.")
        # return
 
     try:
         start = dt.datetime.now()
-        answer = llm_answer(uid, msg.text,who)
+        answer = llm_answer(uid, msg.text, who)
         safe_send(bot, uid, answer)
         dur = dt.datetime.now() - start
-        print(f"[{uid}] {dur.total_seconds():.1f}s ⇒ {len(answer)} симв.")
+        logging.info("OUT uid=%s dur=%.1fs len=%d", uid, dur.total_seconds(), len(answer))
     except Exception as e:
         bot.reply_to(msg, f"⚠️ Ошибка: {e}")
         raise

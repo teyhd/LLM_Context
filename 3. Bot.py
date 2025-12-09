@@ -118,22 +118,46 @@ def trim_history(uid: int) -> list[dict]:
     DIALOGS[uid] = history
     return history
 
-def build_prompt(messages: list[dict], who: str) -> str:
-    """Формируем prompt из всей истории (как в датасете: system + user-инструкция + assistant)."""
-    parts = []
+def build_chat_messages(messages: list[dict], who: str) -> list[dict]:
+    """Готовим историю в формате chat_template Mistral и приводим к чередованию user/assistant."""
+    templated = []
     for m in messages:
         role = m.get("role")
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        if role == "system":
-            parts.append(f"[system]{content}[/system]")
-        elif role == "user":
-            user_text = USER_INSTRUCTION_TEMPLATE.format(who=who, text=content)
-            parts.append(f"[user]{user_text}[/user]")
+        if role == "user":
+            content = USER_INSTRUCTION_TEMPLATE.format(who=who, text=content)
+        templated.append({"role": role, "content": content})
+
+    merged = []
+    for m in templated:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1]["content"] += "\n" + m["content"]
         else:
-            parts.append(f"[assistant]{content}[/assistant]")
-    return "\n".join(parts) + "\n[assistant]"
+            merged.append(m)
+
+    has_system = merged and merged[0]["role"] == "system"
+    core = merged[1:] if has_system else merged
+
+    while core and core[0]["role"] == "assistant":
+        core = core[1:]
+
+    alternated = [{"role": "system", "content": merged[0]["content"]}] if has_system else []
+    for m in core:
+        if not alternated:
+            if m["role"] == "assistant":
+                continue
+            alternated.append(m)
+            continue
+        if alternated[-1]["role"] == m["role"]:
+            alternated[-1]["content"] += "\n" + m["content"]
+        else:
+            alternated.append(m)
+
+    while alternated and alternated[-1]["role"] != "user":
+        alternated.pop()
+    return alternated
 
 def log_context(uid: int, who: str, history: list[dict], prompt: str, prompt_tokens: int) -> None:
     """Логируем весь контекст перед генерацией, чтобы видеть, что ушло в модель."""
@@ -151,7 +175,15 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
         reset_dialog(user_id)
     DIALOGS[user_id].append({"role": "user", "content": text})
     history = trim_history(user_id)
-    prompt = build_prompt(history, who)
+    chat_ctx = build_chat_messages(history, who)
+    if not chat_ctx:
+        return "История пуста, отправьте сообщение ещё раз."
+
+    prompt = tokenizer.apply_chat_template(
+        chat_ctx,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     inputs = tokenizer(
         prompt,
         return_tensors="pt",

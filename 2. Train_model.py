@@ -37,7 +37,7 @@ RUN_NAME               = "vlad"
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
 NUM_EPOCHS             = 2
-BATCH_SIZE             = 1
+BATCH_SIZE             = 2
 GRAD_ACC               = 8
 LEARNING_RATE          = 1e-5
 
@@ -52,7 +52,7 @@ LORA_DROPOUT           = 0.15
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
-   # "q_proj",
+   # "qkv_proj",
    # "k_proj",
    # "v_proj",
     "o_proj",
@@ -61,7 +61,7 @@ TARGET_MODULES = [
   #  "down_proj",
 ]
 
-SAVE_STEPS             = 500
+SAVE_STEPS             = 100
 EVAL_STEPS             = 100
 SAVE_LIMIT             = 3
 EARLY_PATIENCE         = 30  # реальная ранняя остановка
@@ -76,7 +76,7 @@ MAX_GEN_TOKENS         = 128
 TEMPERATURE            = 0.65
 TOP_P                  = 0.8
 
-ANALYTICS_STEPS        = 100  # шаги, через которые шлём короткую сводку
+ANALYTICS_STEPS        = 5  # шаги, через которые шлём короткую сводку
 
 SEED                   = 42
 
@@ -97,7 +97,7 @@ def notify(msg: str) -> None:
     try:
         import requests
         print(msg)
-        requests.get(NOTIFY_URL, params={"msg": f"SRV: {msg[:1000]}"}, timeout=3)
+        requests.get(NOTIFY_URL, params={"msg": f"SRV: {msg[:1000]}"})
     except Exception as e:                                     # noqa: BLE001
         logging.warning(f"notify failed: {e}")
 
@@ -126,11 +126,7 @@ def read_jsonl(path: Path) -> List[Dict]:
 
 def format_chat(messages: List[Dict]) -> (str, str):
     """
-    Возвращает:
-      - prompt: все сообщения до последнего assistant (system/user/assistant, размечены тегами)
-      - answer: содержание последнего assistant
-
-    Предполагаем структуру: [system?] ...(диалог)..., assistant(последний).
+    Готовим prompt через штатный шаблон Mistral, ответ — последний assistant.
     """
     ass_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
     if not ass_indices:
@@ -141,23 +137,54 @@ def format_chat(messages: List[Dict]) -> (str, str):
     if not answer:
         return "", ""
 
-    prompt_parts = []
-    for m in messages[:last_ass_idx]:
-        role = m["role"]
-        content = m["content"].strip()
-        if not content:
-            continue
+    def to_alternating(msgs: List[Dict]) -> List[Dict]:
+        # Склеиваем подряд идущие роли и убираем пустое содержимое
+        merged = []
+        for m in msgs:
+            content = m["content"].strip()
+            if not content:
+                continue
+            role = m["role"]
+            if merged and merged[-1]["role"] == role:
+                merged[-1]["content"] += "\n" + content
+            else:
+                merged.append({"role": role, "content": content})
 
-        if role == "system":
-            tag = "system"
-        elif role == "user":
-            tag = "user"
-        else:
-            tag = "assistant"
+        # Оставляем только первый system, если он есть
+        has_system = merged and merged[0]["role"] == "system"
+        core = merged[1:] if has_system else merged
 
-        prompt_parts.append(f"[{tag}]{content}[/{tag}]")
+        # Убираем ведущие assistant, чтобы диалог начинался с user
+        while core and core[0]["role"] == "assistant":
+            core = core[1:]
 
-    prompt = "\n".join(prompt_parts) + "\n[assistant]"
+        # Гарантируем чередование user/assistant
+        alternated = [{"role": "system", "content": merged[0]["content"]}] if has_system else []
+        for m in core:
+            if not alternated:
+                if m["role"] == "assistant":
+                    continue
+                alternated.append(m)
+                continue
+            if alternated[-1]["role"] == m["role"]:
+                alternated[-1]["content"] += "\n" + m["content"]
+            else:
+                alternated.append(m)
+
+        # Обрезаем хвост, чтобы закончить на user (требование шаблона)
+        while alternated and alternated[-1]["role"] != "user":
+            alternated.pop()
+        return alternated
+
+    chat_ctx = to_alternating(messages[:last_ass_idx])
+    if not chat_ctx:
+        return "", ""
+
+    prompt = tokenizer.apply_chat_template(
+        chat_ctx,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     return prompt, answer
 
 def build_dataset(raw: List[Dict]) -> Dataset:
@@ -242,7 +269,7 @@ class CSVLogger(TrainerCallback):
     def __init__(self):
         self.header = False
 
-def on_log(self, args, state, control, logs=None, **kw):
+    def on_log(self, args, state, control, logs=None, **kw):
         if not CSV_METRICS or not logs:
             return
         csv_path = OUT_DIR / CSV_FILE

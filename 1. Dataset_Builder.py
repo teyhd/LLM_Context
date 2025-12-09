@@ -34,7 +34,6 @@ VALIDATION_RATIO = 0.1         # доля блоков, попадающих в 
 RANDOM_SEED      = 42          # фиксируем сид для воспроизводимости сплита
 
 # ---- ПАРАМЕТРЫ ИНСТРУКЦИИ К USER-СООБЩЕНИЮ ----
-USER_NAME = "WHO"
 USER_INSTRUCTION_TEMPLATE = "Имя пользователя: {who}. Напиши ответ на сообщение: {text}"
 
 # ========================================
@@ -213,7 +212,7 @@ def write_jsonl_line(f, obj):
     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def apply_user_instruction(messages: list):
+def apply_user_instruction(messages: list, user_name: str):
     """
     Трансформирует все user-сообщения в формате:
     'Имя пользователя: WHO. Напиши ответ на сообщение: TEXT'
@@ -222,7 +221,7 @@ def apply_user_instruction(messages: list):
         if m["role"] == "user":
             original_text = m["content"]
             m["content"] = USER_INSTRUCTION_TEMPLATE.format(
-                who=USER_NAME,
+                who=user_name,
                 text=original_text
             )
 
@@ -325,7 +324,7 @@ def generate_jsonl(dialogs_all: list):
 
             # копия compact для модификации user-сообщений
             msgs_for_json = [dict(m) for m in compact]
-            apply_user_instruction(msgs_for_json)
+            apply_user_instruction(msgs_for_json, person)
 
             msg_obj = {
                 "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + msgs_for_json
@@ -411,7 +410,6 @@ def generate_jsonl(dialogs_all: list):
 
 
 def main():
-    global USER_NAME
     dialogs_all = []
     total_msgs = 0
 
@@ -425,7 +423,6 @@ def main():
     for path in files:
         data = load_data(path)
         name = data.get("name") or os.path.basename(path)
-        USER_NAME = name
         msgs = data.get("messages", [])
         total_msgs += len(msgs)
         dialogs = process_chat(msgs)

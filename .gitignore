@@ -1,6 +1,7 @@
 data
 input
 output
+models
 logs
 *.log
 __pycache__/

@@ -48,13 +48,13 @@ MAX_GRAD_NORM          = 0.0
 
 LORA_R                 = 32#8
 LORA_ALPHA             = 64#16
-LORA_DROPOUT           = 0.14
+LORA_DROPOUT           = 0.15
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
-   "q_proj",
-  #  "k_proj",
-   "v_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
     "o_proj",
     "gate_proj",
   #  "up_proj",

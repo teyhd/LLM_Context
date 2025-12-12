@@ -32,7 +32,7 @@ VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
 # фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad3"
+RUN_NAME               = "vlad4"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
@@ -55,30 +55,30 @@ TARGET_MODULES = [
     "q_proj",
    # "k_proj",
     "v_proj",
-   # "o_proj",
+    "o_proj",
     "gate_proj",
    # "up_proj",
    # "down_proj",
 ]
 
-SAVE_STEPS             = 250
-EVAL_STEPS             = 250
-SAVE_LIMIT             = 3
-EARLY_PATIENCE         = 8   # реальная ранняя остановка
+SAVE_STEPS             = 100
+EVAL_STEPS             = 100
+SAVE_LIMIT             = 4
+EARLY_PATIENCE         = 20   # реальная ранняя остановка
 
 LOG_STEPS              = 5
 CSV_METRICS            = True
 CSV_FILE               = "metrics.csv"
 LOSS_ALERT             = 5.0
 
-GEN_INTERVAL           = 10
+GEN_INTERVAL           = 30
 MAX_GEN_TOKENS         = 128
 TEMPERATURE            = 0.4
 TOP_P                  = 0.7
 
 ANALYTICS_STEPS        = 5  # шаги, через которые шлём короткую сводку
 
-SEED                   = 42
+SEED                   = 28
 
 USE_FP16               = True
 USE_BF16               = torch.cuda.is_available() and torch.cuda.is_bf16_supported()

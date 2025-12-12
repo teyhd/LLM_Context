@@ -61,8 +61,8 @@ TARGET_MODULES = [
    # "down_proj",
 ]
 
-SAVE_STEPS             = 25
-EVAL_STEPS             = 25
+SAVE_STEPS             = 250
+EVAL_STEPS             = 250
 SAVE_LIMIT             = 3
 EARLY_PATIENCE         = 8   # реальная ранняя остановка
 

@@ -48,7 +48,7 @@ async def main():
     for f in filters:
         print("─────────────────────────────────────────────")
         print(f"Тип: {type(f).__name__}")
-
+        print(f)
         # Название, если есть
         title_obj = getattr(f, "title", None)
         title_text = getattr(title_obj, "text", None) if title_obj is not None else None

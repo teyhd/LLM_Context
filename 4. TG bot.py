@@ -34,10 +34,7 @@ LOG_DIR = Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_MODEL_ID = os.getenv("base_model_id") or "mistralai/Mistral-7B-Instruct-v0.3"
-SYSTEM_PROMPT = os.getenv("system_prompt") or (
-    "Ты дружелюбный и лаконичный помощник.\n"
-    "Главный фокус — переписки и вопросы по IT: отвечай по делу, без лишней воды."
-)
+SYSTEM_PROMPT = os.getenv("system_prompt") or "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
 USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
 
 MAX_CONTEXT_TOKENS = int(os.getenv("max_context_tokens") or "2048")
@@ -47,7 +44,8 @@ ADMIN_ID = int(os.getenv("admin_id") or "304622290")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-
+COUNT = 0
+STOPED = False
 
 @dataclass
 class RuntimeParams:
@@ -64,8 +62,8 @@ class RuntimeParams:
 P = RuntimeParams(
     lora_adapter_dir=os.getenv("lora_adapter_dir") or "models/vlad/final_adapter",
     max_new_tokens=int(os.getenv("max_new_tokens") or "128"),
-    temperature=float(os.getenv("temperature") or "0.5"),
-    top_p=float(os.getenv("top_p") or "0.8"),
+    temperature=float(os.getenv("temperature") or "0.4"),
+    top_p=float(os.getenv("top_p") or "0.7"),
     whoo_default=os.getenv("whoo_default") or "Без имени",
     whoo_locked=(os.getenv("whoo_locked") or "false").lower() == "true",
     whoo_value=os.getenv("whoo_value") or "Без имени",
@@ -122,8 +120,8 @@ def params_text() -> str:
 async def reply_safe(event: events.NewMessage.Event, text: str) -> None:
     chunk_size = 4000
     for i in range(0, len(text), chunk_size):
-        await event.reply(text[i:i + chunk_size])
-
+        await event.reply(text[i:i + chunk_size])    
+       # await client.send_message(await get_whoo(event),text[i:i + chunk_size])
 
 # ───────────────────────────── LLM LOAD/GEN ─────────────────────────────
 tokenizer = None
@@ -132,10 +130,11 @@ model = None
 
 DIALOGS: Dict[int, List[dict]] = {}  # chat_id -> history
 
-
 def reset_dialog(chat_id: int) -> None:
     DIALOGS[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+def hard_reset():
+    DIALOGS = {}
 
 def trim_history(chat_id: int) -> List[dict]:
     history = DIALOGS.get(chat_id, [])
@@ -189,7 +188,6 @@ def build_chat_messages(messages: List[dict], who: str) -> List[dict]:
         alternated.pop()
 
     return alternated
-
 
 def current_gen_cfg() -> GenerationConfig:
     return GenerationConfig(
@@ -275,7 +273,17 @@ def llm_answer(chat_id: int, text: str, who: str) -> str:
     output_ids = model.generate(**inputs, generation_config=current_gen_cfg())[0]
     answer_ids = output_ids[len(prompt_ids):]
     answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-
+    if "😂" in answer:
+        return False
+    if "Вхвхв" in answer:
+        return False
+    if "Вхвхвхвх" in answer:
+        return False
+    if "Вхвх" in answer:
+        return False
+    if "ахах" in answer:
+        return False
+      
     DIALOGS[chat_id].append({"role": "assistant", "content": answer})
     trim_history(chat_id)
     return answer
@@ -316,11 +324,8 @@ async def load_filter_chat_ids(filter_id: int) -> set[int]:
         ids.add(ent.id)
     return ids
 
-
-def is_admin(event: events.NewMessage.Event) -> bool:
-    s = event.sender
-    return bool(s and getattr(s, "id", None) == ADMIN_ID)
-
+async def is_admin(event: events.NewMessage.Event) -> bool:
+    return bool(await get_whoo(event) == ADMIN_ID)
 
 async def get_whoo(event: events.NewMessage.Event) -> str:
     """
@@ -365,8 +370,6 @@ async def get_whoo(event: events.NewMessage.Event) -> str:
     # 3️⃣ последний fallback
     return P.whoo_default or "Без имени"
 
-
-
 async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
     t = text.strip()
     if not t.startswith("/"):
@@ -385,22 +388,39 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
             "/who — снять закрепление WHOO (admin)\n"
             "/reload_lora <path> — перезагрузить LoRA (admin)\n"
             "/clear — очистить историю этого чата (admin)\n",
+            "/stop\n",
+            "/bred\n",
         )
         return True
 
     if cmd == "/params":
         await reply_safe(event, params_text())
         return True
-
-    if not is_admin(event):
-        await reply_safe(event, "Недостаточно прав.")
-        return True
-
-    if cmd == "/clear":
+    
+    if cmd == "/clear" or cmd == "/стой":
         reset_dialog(event.chat_id)
         await reply_safe(event, "Контекст очищен для этого чата.")
         return True
 
+    if not is_admin(event):
+        await reply_safe(event, "Недостаточно прав.")
+        return True
+    
+    if cmd == "/stop":
+        global STOPED
+        if STOPED:
+            STOPED = False
+        else:
+            STOPED = True
+
+        await reply_safe(event, f"Остановлен: {STOPED}")
+        return True
+
+    if cmd == "/bred":
+        hard_reset()
+        await reply_safe(event, "Диалог удален")
+        return True
+    
     if cmd == "/who":
         if args:
             P.whoo_value = " ".join(args).strip()
@@ -453,6 +473,8 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
 
 @client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
+    global target_chat_ids, COUNT
+
     if event.out:
         return
 
@@ -467,10 +489,13 @@ async def on_new_message(event: events.NewMessage.Event):
     # команды (без генерации)
     if await handle_command(event, incoming_text):
         return
+    
+    if STOPED:
+        return
 
     who = await get_whoo(event)
     sender_id = getattr(event.sender, "id", 0) or 0
-
+ 
     # лог входящего
     log_msg(chat_id, sender_id, who, "IN", incoming_text)
 
@@ -486,7 +511,12 @@ async def on_new_message(event: events.NewMessage.Event):
 
     # лог исходящего + отправка
     log_msg(chat_id, sender_id, who, "OUT", answer)
+    
     await reply_safe(event, answer)
+
+    COUNT = COUNT + 1
+    if COUNT % 3 == 0:
+        target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
 
 
 async def main():

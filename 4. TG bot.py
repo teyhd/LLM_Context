@@ -1,3 +1,7 @@
+# tg_llm_userbot.py
+# Требования: pip install telethon python-dotenv transformers peft torch psutil
+# (и CUDA/torch по желанию)
+
 import os
 import gc
 import asyncio
@@ -16,7 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 
-# ───────────────────────────── CONFIG ─────────────────────────────
+# ───────────────────────────── ENV/CONFIG ─────────────────────────────
 load_dotenv()
 
 API_ID = int(os.getenv("api_id"))
@@ -24,7 +28,6 @@ API_HASH = os.getenv("api_hash")
 SESSION_NAME = os.getenv("tg_session_name") or "session_name"
 
 TARGET_FILTER_ID = int(os.getenv("tg_filter_id") or "5")  # "Отбор" = 5
-CONTEXT_COUNT = int(os.getenv("tg_context_count") or "5")  # не обязательно, есть своя история
 TYPING_EVERY_SEC = float(os.getenv("tg_typing_every_sec") or "4.0")
 
 LOG_DIR = Path("logs")
@@ -40,7 +43,7 @@ USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши 
 MAX_CONTEXT_TOKENS = int(os.getenv("max_context_tokens") or "2048")
 MAX_HISTORY_MESSAGES = int(os.getenv("max_history_messages") or "40")
 
-ADMIN_ID = int(os.getenv("admin_id") or "304622290")  # кто может менять параметры
+ADMIN_ID = int(os.getenv("admin_id") or "304622290")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -53,9 +56,9 @@ class RuntimeParams:
     temperature: float = 0.5
     top_p: float = 0.8
 
-    whoo_default: str = "Без имени"   # дефолт, если имени в чате нет
-    whoo_locked: bool = False         # если True — используем whoo_value
-    whoo_value: str = "Без имени"     # значение, когда locked=True
+    whoo_default: str = "Без имени"
+    whoo_locked: bool = False
+    whoo_value: str = "Без имени"
 
 
 P = RuntimeParams(
@@ -68,30 +71,66 @@ P = RuntimeParams(
     whoo_value=os.getenv("whoo_value") or "Без имени",
 )
 
-# ───────────────────────────── LOGGING ─────────────────────────────
+# ───────────────────────────── HELPERS ─────────────────────────────
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def log_msg(chat_id: int, direction: str, text: str) -> None:
-    ts_file = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fn = f"{ts_file}_chat{chat_id}_{direction}.log"
-    (LOG_DIR / fn).write_text(
-        f"{now_ts()} | {direction} | chat_id={chat_id}\n{text}\n",
-        encoding="utf-8",
-    )
 
 
 def ram_mb() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / 2**20
 
 
-# ───────────────────────────── LLM ─────────────────────────────
+def _safe_name(s: str) -> str:
+    s = (s or "").strip()
+    for ch in '<>:"/\\|?*\n\r\t':
+        s = s.replace(ch, "_")
+    s = " ".join(s.split())
+    return (s[:80] or "noname")
+
+
+def _log_path(chat_id: int, sender_id: int, who: str) -> Path:
+    chat_dir = LOG_DIR / f"chat_{chat_id}"
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    return chat_dir / f"user_{sender_id}_{_safe_name(who)}.log"
+
+
+def log_msg(chat_id: int, sender_id: int, who: str, direction: str, text: str) -> None:
+    """
+    Один файл на пользователя (в рамках чата). Каждая строка с временем.
+    """
+    path = _log_path(chat_id, sender_id, who)
+    safe_text = (text or "").replace("\n", "\\n")
+    line = f"{now_ts()} | {direction:<3} | {safe_text}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def params_text() -> str:
+    return (
+        f"DEVICE={DEVICE}\n"
+        f"RAM={ram_mb():.0f} MB\n\n"
+        f"LORA_ADAPTER_DIR={P.lora_adapter_dir}\n"
+        f"MAX_NEW_TOKENS={P.max_new_tokens}\n"
+        f"TEMPERATURE={P.temperature}\n"
+        f"TOP_P={P.top_p}\n\n"
+        f"WHOO_LOCKED={P.whoo_locked}\n"
+        f"WHOO_VALUE={P.whoo_value}\n"
+        f"WHOO_DEFAULT={P.whoo_default}"
+    )
+
+
+async def reply_safe(event: events.NewMessage.Event, text: str) -> None:
+    chunk_size = 4000
+    for i in range(0, len(text), chunk_size):
+        await event.reply(text[i:i + chunk_size])
+
+
+# ───────────────────────────── LLM LOAD/GEN ─────────────────────────────
 tokenizer = None
 base_model = None
 model = None
 
-DIALOGS: Dict[int, List[dict]] = {}  # chat_id -> [{"role","content"}, ...]
+DIALOGS: Dict[int, List[dict]] = {}  # chat_id -> history
 
 
 def reset_dialog(chat_id: int) -> None:
@@ -166,7 +205,6 @@ def current_gen_cfg() -> GenerationConfig:
 def load_llm(lora_dir: str) -> None:
     global tokenizer, base_model, model
 
-    # выгружаем старое
     with contextlib.suppress(Exception):
         if model is not None:
             del model
@@ -179,26 +217,30 @@ def load_llm(lora_dir: str) -> None:
         torch.cuda.empty_cache()
 
     print(f"[LLM] Loading tokenizer: {BASE_MODEL_ID}")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer_local = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=False)
+    if tokenizer_local.pad_token_id is None:
+        tokenizer_local.pad_token = tokenizer_local.eos_token
 
     print(f"[LLM] Loading base model: {BASE_MODEL_ID} ({DEVICE}/{DTYPE})")
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base_local = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         torch_dtype=DTYPE,
         device_map={"": DEVICE},
     )
-    base_model.resize_token_embeddings(len(tokenizer))
+    base_local.resize_token_embeddings(len(tokenizer_local))
 
     print(f"[LLM] Loading LoRA adapter: {lora_dir}")
-    model = PeftModel.from_pretrained(
-        base_model,
+    model_local = PeftModel.from_pretrained(
+        base_local,
         lora_dir,
         torch_dtype=DTYPE,
         device_map={"": DEVICE},
     )
-    model.eval()
+    model_local.eval()
+
+    tokenizer = tokenizer_local
+    base_model = base_local
+    model = model_local
     print("[LLM] Ready.")
 
 
@@ -222,6 +264,7 @@ def llm_answer(chat_id: int, text: str, who: str) -> str:
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False).input_ids
     if len(prompt_ids) > MAX_CONTEXT_TOKENS:
         prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
+        # пересобираем текст для отладки/согласованности, но генерация идёт по prompt_ids
         prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
     inputs = {
@@ -238,7 +281,7 @@ def llm_answer(chat_id: int, text: str, who: str) -> str:
     return answer
 
 
-# ───────────────────────────── TELEGRAM (USER) ─────────────────────────────
+# ───────────────────────────── TELETHON USERBOT ─────────────────────────────
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 target_chat_ids: set[int] = set()
 
@@ -265,7 +308,7 @@ async def load_filter_chat_ids(filter_id: int) -> set[int]:
 
     include_peers = getattr(f, "include_peers", None)
     if include_peers is None:
-        raise RuntimeError(f"Фильтр id={filter_id} не содержит include_peers (похоже на системный)")
+        raise RuntimeError(f"Фильтр id={filter_id} не содержит include_peers")
 
     ids = set()
     for p in include_peers:
@@ -274,64 +317,57 @@ async def load_filter_chat_ids(filter_id: int) -> set[int]:
     return ids
 
 
-def get_sender_name(event: events.NewMessage.Event) -> str:
-    """
-    WHOO — имя собеседника.
-    Если WHOO закреплён (/who Имя) — используем его.
-    Иначе берём из Telegram, а если пусто — whoo_default ("Без имени").
-    """
-    if P.whoo_locked and (P.whoo_value or "").strip():
-        return P.whoo_value.strip()
-
-    s = event.sender
-    # sender может быть None в некоторых случаях — используем chat/дефолт
-    name_parts = []
-    if s is not None:
-        fn = (getattr(s, "first_name", None) or "").strip()
-        ln = (getattr(s, "last_name", None) or "").strip()
-        un = (getattr(s, "username", None) or "").strip()
-        if fn:
-            name_parts.append(fn)
-        if ln:
-            name_parts.append(ln)
-        if not name_parts and un:
-            name_parts.append(un)
-
-    name = " ".join(name_parts).strip()
-    return name or P.whoo_default
-
-
 def is_admin(event: events.NewMessage.Event) -> bool:
     s = event.sender
     return bool(s and getattr(s, "id", None) == ADMIN_ID)
 
 
-async def reply_safe(event: events.NewMessage.Event, text: str) -> None:
-    # Телега режет длинные сообщения — отправим кусками
-    chunk_size = 4000
-    for i in range(0, len(text), chunk_size):
-        await event.reply(text[i:i + chunk_size])
+async def get_whoo(event: events.NewMessage.Event) -> str:
+    """
+    Надёжно извлекает имя отправителя:
+    1. first_name + last_name
+    2. username
+    3. title (для чатов/каналов)
+    4. fallback: 'Без имени'
+    """
 
+    # 1️⃣ если WHOO закреплён вручную
+    if P.whoo_locked and (P.whoo_value or "").strip():
+        return P.whoo_value.strip()
 
-def params_text() -> str:
-    return (
-        f"DEVICE={DEVICE}\n"
-        f"RAM={ram_mb():.0f} MB\n\n"
-        f"LORA_ADAPTER_DIR={P.lora_adapter_dir}\n"
-        f"MAX_NEW_TOKENS={P.max_new_tokens}\n"
-        f"TEMPERATURE={P.temperature}\n"
-        f"TOP_P={P.top_p}\n\n"
-        f"WHOO_LOCKED={P.whoo_locked}\n"
-        f"WHOO_VALUE={P.whoo_value}\n"
-        f"WHOO_DEFAULT={P.whoo_default}"
-    )
+    try:
+        # 2️⃣ ЯВНО резолвим entity по sender_id
+        sender_id = event.sender_id
+        if sender_id:
+            entity = await client.get_entity(sender_id)
+
+            # 👤 пользователь
+            if hasattr(entity, "first_name"):
+                parts = []
+                if entity.first_name:
+                    parts.append(entity.first_name)
+                if getattr(entity, "last_name", None):
+                    parts.append(entity.last_name)
+                if parts:
+                    return " ".join(parts)
+
+                # username как fallback
+                if getattr(entity, "username", None):
+                    return entity.username
+
+            # 👥 чат / канал
+            if hasattr(entity, "title") and entity.title:
+                return entity.title
+
+    except Exception as e:
+        print(f"[WHOO] resolve failed: {e}")
+
+    # 3️⃣ последний fallback
+    return P.whoo_default or "Без имени"
+
 
 
 async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
-    """
-    Возвращает True, если сообщение было командой и обработано.
-    Команды доступны только ADMIN_ID (кроме /params, /help для диагностики).
-    """
     t = text.strip()
     if not t.startswith("/"):
         return False
@@ -356,7 +392,6 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
         await reply_safe(event, params_text())
         return True
 
-    # дальше — только админ
     if not is_admin(event):
         await reply_safe(event, "Недостаточно прав.")
         return True
@@ -373,7 +408,7 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
             await reply_safe(event, f"WHOO закреплён: {P.whoo_value}")
         else:
             P.whoo_locked = False
-            await reply_safe(event, "WHOO больше не закреплён — имя будет браться из чата (или 'Без имени').")
+            await reply_safe(event, "WHOO не закреплён — имя будет браться из Telegram (или 'Без имени').")
         return True
 
     if cmd == "/set":
@@ -418,7 +453,6 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
 
 @client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
-    # не реагируем на свои исходящие
     if event.out:
         return
 
@@ -430,14 +464,15 @@ async def on_new_message(event: events.NewMessage.Event):
     if not incoming_text:
         return  # только текст
 
-    # команды обрабатываем отдельно (и не запускаем генерацию)
+    # команды (без генерации)
     if await handle_command(event, incoming_text):
         return
 
-    who = get_sender_name(event)
+    who = await get_whoo(event)
+    sender_id = getattr(event.sender, "id", 0) or 0
 
     # лог входящего
-    log_msg(chat_id, "IN", f"WHO={who}\n{incoming_text}")
+    log_msg(chat_id, sender_id, who, "IN", incoming_text)
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(chat_id, stop_typing))
@@ -450,20 +485,20 @@ async def on_new_message(event: events.NewMessage.Event):
             await typing_task
 
     # лог исходящего + отправка
-    log_msg(chat_id, "OUT", f"WHO={who}\n{answer}")
+    log_msg(chat_id, sender_id, who, "OUT", answer)
     await reply_safe(event, answer)
 
 
 async def main():
-    # 1) грузим модель
+    # 1) модель
     load_llm(P.lora_adapter_dir)
 
-    # 2) логинимся в телеграм как пользователь
+    # 2) telegram user auth
     await client.start()
     me = await client.get_me()
     print(f"[INFO] Telegram user: {me.id} {me.first_name} @{me.username}")
 
-    # 3) берём чаты из папки id=5
+    # 3) target chats from filter
     global target_chat_ids
     target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
     print(f"[INFO] Filter id={TARGET_FILTER_ID}: chats={len(target_chat_ids)}")

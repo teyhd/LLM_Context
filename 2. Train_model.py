@@ -32,30 +32,30 @@ VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
 # фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad2"
+RUN_NAME               = "vlad3"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
 NUM_EPOCHS             = 3
 BATCH_SIZE             = 2
 GRAD_ACC               = 4
-LEARNING_RATE          = 5e-5
+LEARNING_RATE          = 2e-5
 
 WARMUP_FRAC            = 0.05
 WEIGHT_DECAY           = 0.01
 MAX_SEQ_LEN            = 2048
 MAX_GRAD_NORM          = 0.3
 
-LORA_R                 = 16#8
-LORA_ALPHA             = 32#16
+LORA_R                 = 32#8
+LORA_ALPHA             = 64#16
 LORA_DROPOUT           = 0.2
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
     "q_proj",
    # "k_proj",
-   # "v_proj",
-    "o_proj",
+    "v_proj",
+   # "o_proj",
     "gate_proj",
    # "up_proj",
    # "down_proj",

@@ -19,7 +19,7 @@ SHORT_ANS_JSONL     = "data/output/short_assistants.jsonl"
 TIME_WINDOW_HOURS   = 1
 MERGE_INTERVAL_MIN  = 5
 
-SYSTEM_PROMPT    = "Ты дружелюбный и лаконичный помощник.\nГлавный фокус — переписки и вопросы по IT: отвечай по делу, без лишней воды."
+SYSTEM_PROMPT    = "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
 ASSISTANT_NAMES     = {"Vs"}
 MIN_ASSISTANT_CHARS = 5
 KEEP_SHORT_ASSISTANTS = True

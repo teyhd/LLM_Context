@@ -55,14 +55,14 @@ TARGET_MODULES = [
     "q_proj",
    # "k_proj",
     "v_proj",
-    "o_proj",
+    #"o_proj",
     "gate_proj",
    # "up_proj",
    # "down_proj",
 ]
 
-SAVE_STEPS             = 100
-EVAL_STEPS             = 100
+SAVE_STEPS             = 200
+EVAL_STEPS             = 200
 SAVE_LIMIT             = 4
 EARLY_PATIENCE         = 20   # реальная ранняя остановка
 
@@ -71,7 +71,7 @@ CSV_METRICS            = True
 CSV_FILE               = "metrics.csv"
 LOSS_ALERT             = 5.0
 
-GEN_INTERVAL           = 30
+GEN_INTERVAL           = 25
 MAX_GEN_TOKENS         = 128
 TEMPERATURE            = 0.4
 TOP_P                  = 0.7

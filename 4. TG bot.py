@@ -195,6 +195,9 @@ def current_gen_cfg() -> GenerationConfig:
         temperature=P.temperature,
         top_p=P.top_p,
         do_sample=True,
+       # top_k=50,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=4,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )

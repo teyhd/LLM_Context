@@ -14,7 +14,6 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 eos_id = tokenizer.eos_token_id
 
-
 def to_alternating(messages: List[Dict]) -> List[Dict]:
     merged = []
     for m in messages:

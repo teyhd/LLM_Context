@@ -16,21 +16,21 @@ VALIDATION_JSONL    = "data/output/valid.jsonl"
 ORPHANS_JSONL       = "data/output/orphans.jsonl"
 SHORT_ANS_JSONL     = "data/output/short_assistants.jsonl"
 
-TIME_WINDOW_HOURS   = 0.7
-MERGE_INTERVAL_MIN  = 5
+TIME_WINDOW_HOURS   = 1.5
+MERGE_INTERVAL_MIN  = 10
 
 SYSTEM_PROMPT    = "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
 ASSISTANT_NAMES     = {"Vs"}
 MIN_ASSISTANT_CHARS = 5
 KEEP_SHORT_ASSISTANTS = True
-MIN_MESSAGES_IN_BLOCK = 2
+MIN_MESSAGES_IN_BLOCK = 3
 MERGE_ASSISTANT_ALWAYS = True
 
 LOG_LEVEL = logging.INFO
 LOG_FILE  = "data/output/build_dataset.log"
 
 VALIDATION_RATIO = 0.1
-RANDOM_SEED      = 28
+RANDOM_SEED      = 42
 
 USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
 

@@ -16,7 +16,7 @@ from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizati
 
 # ──────────────────────── Константы ─────────────────────────
 BASE_MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.3"
-LORA_ADAPTER_DIR  = "models/vlad4/checkpoint-1100"
+LORA_ADAPTER_DIR  = "models/vlad5/checkpoint-1000" #final_adapter  checkpoint-625
 
 SYSTEM_PROMPT    = "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
 USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
@@ -30,13 +30,13 @@ DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE             = torch.float16 if DEVICE == "cuda" else torch.float32
 
 MAX_NEW_TOKENS    = 128  
-TEMPERATURE       = 0.4
-TOP_P             = 0.7        
-TOP_K             =50  # 40–100
-REPETITION_PENALTY=1.2   # 1.1–1.3
-NO_REPEAT_NGRAM_SIZE=4   # 3–6
+TEMPERATURE       = 0.4#7
+TOP_P             = 0.95#35      
+TOP_K             = 40  # 40–100
+REPETITION_PENALTY= 1.2   # 1.1–1.3
+NO_REPEAT_NGRAM_SIZE= 6   # 3–6
 
-WHOO = "Алиса Юрьевна"
+WHOO = "Сорокина Н Н"
 
 LOG_FILE = "bot.log"
 logging.basicConfig(
@@ -101,6 +101,9 @@ GEN_CFG = GenerationConfig(
     max_new_tokens = MAX_NEW_TOKENS,
     temperature    = TEMPERATURE,
     top_p          = TOP_P,
+    top_k          = TOP_K,
+    repetition_penalty = REPETITION_PENALTY,
+    no_repeat_ngram_size = NO_REPEAT_NGRAM_SIZE,
     do_sample      = True,
     eos_token_id   = tokenizer.eos_token_id,
     pad_token_id   = tokenizer.pad_token_id,

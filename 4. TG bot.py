@@ -53,17 +53,21 @@ class RuntimeParams:
     max_new_tokens: int = 128
     temperature: float = 0.5
     top_p: float = 0.8
-
+    top_k: float = 40
+    repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 3
     whoo_default: str = "Без имени"
     whoo_locked: bool = False
     whoo_value: str = "Без имени"
 
-
 P = RuntimeParams(
     lora_adapter_dir=os.getenv("lora_adapter_dir") or "models/vlad/final_adapter",
     max_new_tokens=int(os.getenv("max_new_tokens") or "128"),
-    temperature=float(os.getenv("temperature") or "0.4"),
-    top_p=float(os.getenv("top_p") or "0.7"),
+    temperature=float(os.getenv("temperature") or "0.2"),
+    top_p=float(os.getenv("top_p") or "0.8"),
+    top_k=int(os.getenv("top_k") or "40"),
+    repetition_penalty=float(os.getenv("repetition_penalty") or "1.0"),
+    no_repeat_ngram_size=int(os.getenv("no_repeat_ngram_size") or "4"),
     whoo_default=os.getenv("whoo_default") or "Без имени",
     whoo_locked=(os.getenv("whoo_locked") or "false").lower() == "true",
     whoo_value=os.getenv("whoo_value") or "Без имени",
@@ -120,7 +124,7 @@ def params_text() -> str:
 async def reply_safe(event: events.NewMessage.Event, text: str) -> None:
     chunk_size = 4000
     for i in range(0, len(text), chunk_size):
-        await event.reply(text[i:i + chunk_size])    
+        await event.respond(text[i:i + chunk_size])    
        # await client.send_message(await get_whoo(event),text[i:i + chunk_size])
 
 # ───────────────────────────── LLM LOAD/GEN ─────────────────────────────
@@ -197,7 +201,7 @@ def current_gen_cfg() -> GenerationConfig:
         do_sample=True,
        # top_k=50,
         repetition_penalty=1.2,
-        no_repeat_ngram_size=4,
+       # no_repeat_ngram_size=4,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
@@ -277,14 +281,21 @@ def llm_answer(chat_id: int, text: str, who: str) -> str:
     answer_ids = output_ids[len(prompt_ids):]
     answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
     if "😂" in answer:
+
+        llm_answer(chat_id, text, who)
         return False
     if "Вхвхв" in answer:
+
+        llm_answer(chat_id, text, who)
         return False
     if "Вхвхвхвх" in answer:
+        llm_answer(chat_id, text, who)
         return False
     if "Вхвх" in answer:
+        llm_answer(chat_id, text, who)
         return False
     if "ахах" in answer:
+        llm_answer(chat_id, text, who)
         return False
       
     DIALOGS[chat_id].append({"role": "assistant", "content": answer})
@@ -297,17 +308,18 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 target_chat_ids: set[int] = set()
 
 
-async def keep_typing(chat_id: int, stop_event: asyncio.Event) -> None:
+async def keep_typing(chat_id, stop_event: asyncio.Event):
     try:
         while not stop_event.is_set():
             async with client.action(chat_id, "typing"):
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=TYPING_EVERY_SEC)
-                except asyncio.TimeoutError:
-                    pass
-    except Exception:
-        return
-
+                # Telegram сам гасит статус через несколько секунд,
+                # поэтому обновляем его периодически
+                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        # просто продолжаем цикл, пока не будет stop_event.set()
+        pass
+    except asyncio.CancelledError:
+        pass
 
 async def load_filter_chat_ids(filter_id: int) -> set[int]:
     res = await client(GetDialogFiltersRequest())
@@ -477,7 +489,7 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
 @client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
     global target_chat_ids, COUNT
-
+   
     if event.out:
         return
 
@@ -495,10 +507,12 @@ async def on_new_message(event: events.NewMessage.Event):
     
     if STOPED:
         return
-
+    #print(event.message)
     who = await get_whoo(event)
     sender_id = getattr(event.sender, "id", 0) or 0
- 
+
+    await client.send_read_acknowledge(chat_id, getattr(event.sender, "id", 0))
+
     # лог входящего
     log_msg(chat_id, sender_id, who, "IN", incoming_text)
 
@@ -506,7 +520,8 @@ async def on_new_message(event: events.NewMessage.Event):
     typing_task = asyncio.create_task(keep_typing(chat_id, stop_typing))
 
     try:
-        answer = llm_answer(chat_id, incoming_text, who)
+        async with client.action(chat_id, "typing"):
+            answer = llm_answer(chat_id, incoming_text, who)
     finally:
         stop_typing.set()
         with contextlib.suppress(Exception):
@@ -518,7 +533,7 @@ async def on_new_message(event: events.NewMessage.Event):
     await reply_safe(event, answer)
 
     COUNT = COUNT + 1
-    if COUNT % 3 == 0:
+    if COUNT % 2 == 0:
         target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
 
 

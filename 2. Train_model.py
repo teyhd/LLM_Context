@@ -32,7 +32,7 @@ VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
 # фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad4"
+RUN_NAME               = "vlad6"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
@@ -47,8 +47,8 @@ MAX_SEQ_LEN            = 2048
 MAX_GRAD_NORM          = 0.3
 
 LORA_R                 = 32#8
-LORA_ALPHA             = 64#16
-LORA_DROPOUT           = 0.2
+LORA_ALPHA             = 32#16
+LORA_DROPOUT           = 0.15#15
 
 # Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
 TARGET_MODULES = [
@@ -59,6 +59,15 @@ TARGET_MODULES = [
     "gate_proj",
    # "up_proj",
    # "down_proj",
+]
+#Gemini
+LORA_R = 16  # снижен для малого датасета
+LORA_ALPHA = 32  # 2*rank
+LORA_DROPOUT = 0.25  # повышен для шумных данных
+
+TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",  # attention
+    "gate_proj", "up_proj", "down_proj",      # MLP
 ]
 
 SAVE_STEPS             = 200
@@ -73,12 +82,15 @@ LOSS_ALERT             = 5.0
 
 GEN_INTERVAL           = 25
 MAX_GEN_TOKENS         = 128
-TEMPERATURE            = 0.4
-TOP_P                  = 0.7
+TEMPERATURE            = 0.5
+TOP_P                  = 0.95
+
+REPETITION_PENALTY = 1.2   # 1.1–1.3
+NO_REPEAT_NGRAM_SIZE = 3   # 3–6
 
 ANALYTICS_STEPS        = 5  # шаги, через которые шлём короткую сводку
 
-SEED                   = 28
+SEED                   = 42
 
 USE_FP16               = True
 USE_BF16               = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -391,6 +403,8 @@ class RandomGenerateNotify(TrainerCallback):
                     max_new_tokens=MAX_GEN_TOKENS,
                     temperature=TEMPERATURE,
                     top_p=TOP_P,
+                    repetition_penalty = REPETITION_PENALTY,
+                    no_repeat_ngram_size = NO_REPEAT_NGRAM_SIZE,
                     pad_token_id=eos_id,
                     eos_token_id=eos_id,
                     do_sample=True,

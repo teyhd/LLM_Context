@@ -123,6 +123,8 @@ def params_text() -> str:
 
 async def reply_safe(event: events.NewMessage.Event, text: str) -> None:
     chunk_size = 4000
+    if text == False:
+        return
     for i in range(0, len(text), chunk_size):
         await event.respond(text[i:i + chunk_size])    
        # await client.send_message(await get_whoo(event),text[i:i + chunk_size])
@@ -307,7 +309,6 @@ def llm_answer(chat_id: int, text: str, who: str) -> str:
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 target_chat_ids: set[int] = set()
 
-
 async def keep_typing(chat_id, stop_event: asyncio.Event):
     try:
         while not stop_event.is_set():
@@ -485,7 +486,6 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
 
     return False
 
-
 @client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
     global target_chat_ids, COUNT
@@ -535,7 +535,6 @@ async def on_new_message(event: events.NewMessage.Event):
     COUNT = COUNT + 1
     if COUNT % 2 == 0:
         target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
-
 
 async def main():
     # 1) модель

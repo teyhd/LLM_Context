@@ -16,3 +16,14 @@ TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+
+
+#Gemini
+LORA_R = 16  # снижен для малого датасета
+LORA_ALPHA = 32  # 2*rank
+LORA_DROPOUT = 0.25  # повышен для шумных данных
+
+TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",  # attention
+    "gate_proj", "up_proj", "down_proj",      # MLP
+]

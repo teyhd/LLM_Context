@@ -32,7 +32,7 @@ VAL_FILE               = "valid.jsonl"
 
 OUTPUT_DIR             = "models"
 # фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad6"
+RUN_NAME               = "vlad7"
 
 NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
@@ -60,14 +60,20 @@ TARGET_MODULES = [
    # "up_proj",
    # "down_proj",
 ]
-#Gemini
-LORA_R = 16  # снижен для малого датасета
-LORA_ALPHA = 32  # 2*rank
-LORA_DROPOUT = 0.25  # повышен для шумных данных
-
+LORA_R = 64              # Увеличиваем ранг для лучшего захвата нюансов стиля
+LORA_ALPHA = 128         # Alpha = 2 * R (золотой стандарт стабильности)
+LORA_DROPOUT = 0.05      # 0.25 — слишком много, модель будет недообучаться.
+                         # Для шума лучше 0.05-0.1, не больше.
+# Для Mistral/Llama лучше обучать ВСЕ линейные слои,
+# чтобы стиль "пропитался" и в Attention, и в MLP (где хранятся знания/паттерны)
 TARGET_MODULES = [
-    "q_proj", "k_proj", "v_proj", "o_proj",  # attention
-    "gate_proj", "up_proj", "down_proj",      # MLP
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
 ]
 
 SAVE_STEPS             = 200

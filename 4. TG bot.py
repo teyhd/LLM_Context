@@ -162,9 +162,13 @@ def calc_confidence(scores: List[torch.Tensor], output_ids: torch.Tensor, prompt
         idx = prompt_len + step
         if idx >= len(output_ids):
             break
-        token_id = output_ids[idx]
-        prob = torch.softmax(logits, dim=-1)[token_id]
-        probs.append(prob)
+        token_id = int(output_ids[idx])
+        with torch.no_grad():
+            sm = torch.softmax(logits.float(), dim=-1)
+        if sm.dim() == 2:
+            sm = sm[0]
+        if token_id < sm.shape[-1]:
+            probs.append(sm[token_id])
     if not probs:
         return 0.0
     return float(torch.stack(probs).mean().item())

@@ -3,6 +3,7 @@
 # (и CUDA/torch по желанию)
 import os
 import gc
+import json
 import asyncio
 import contextlib
 from dataclasses import dataclass
@@ -27,7 +28,17 @@ LOG_DIR = Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 BASE_MODEL_ID = os.getenv("base_model_id") or "mistralai/Mistral-7B-Instruct-v0.3"
 SYSTEM_PROMPT = os.getenv("system_prompt") or "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
-USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
+USER_INSTRUCTION_TEMPLATE = os.getenv("user_instruction_template") or "??? ???????????: {who}. ?????? ????? ?? ?????????: {text}"
+PROMPT_CONFIG_PATH = os.getenv("PROMPT_CONFIG_PATH") or "config/prompt_config.json"
+if os.path.exists(PROMPT_CONFIG_PATH):
+    try:
+        with open(PROMPT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _pdata = json.load(f)
+        SYSTEM_PROMPT = _pdata.get("system_prompt") or SYSTEM_PROMPT
+        USER_INSTRUCTION_TEMPLATE = _pdata.get("user_instruction_template") or USER_INSTRUCTION_TEMPLATE
+    except Exception:
+        pass
+
 MAX_CONTEXT_TOKENS = int(os.getenv("max_context_tokens") or "2048")
 MAX_HISTORY_MESSAGES = int(os.getenv("max_history_messages") or "40")
 HISTORY_BACKFILL_MESSAGES = int(os.getenv("history_backfill_messages") or "10")
@@ -113,7 +124,13 @@ DIALOGS: Dict[int, List[dict]] = {}  # chat_id -> history
 def reset_dialog(chat_id: int) -> None:
     DIALOGS[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 def hard_reset():
+    global DIALOGS
     DIALOGS = {}
+def _count_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
 def trim_history(chat_id: int) -> List[dict]:
     history = DIALOGS.get(chat_id, [])
     if not history:
@@ -122,34 +139,16 @@ def trim_history(chat_id: int) -> List[dict]:
     tail = history[1:]
     if len(tail) > MAX_HISTORY_MESSAGES:
         tail = tail[-MAX_HISTORY_MESSAGES:]
+    if MAX_CONTEXT_TOKENS and tokenizer:
+        tokens = [_count_tokens(m.get("content", "")) for m in tail]
+        total = sum(tokens)
+        start_idx = 0
+        while total > MAX_CONTEXT_TOKENS and start_idx < len(tail):
+            total -= tokens[start_idx]
+            start_idx += 1
+        tail = tail[start_idx:]
     DIALOGS[chat_id] = head + tail
     return DIALOGS[chat_id]
-async def backfill_dialog_history(chat_id: int, current_message_id: int | None = None) -> None:
-    """
-    При пустой памяти диалога подтягиваем последние N сообщений из Telegram,
-    чтобы модель видела контекст до перезапуска.
-    """
-    if HISTORY_BACKFILL_MESSAGES <= 0:
-        return
-    if chat_id not in DIALOGS:
-        reset_dialog(chat_id)
-    history = DIALOGS.get(chat_id, [])
-    if len(history) > 1:
-        return  # уже есть накопленный диалог, бэкапы не нужны
-    limit = HISTORY_BACKFILL_MESSAGES + (1 if current_message_id else 0)
-    messages = await client.get_messages(chat_id, limit=limit)
-    restored: List[dict] = []
-    for m in reversed(messages):
-        if current_message_id and getattr(m, "id", None) == current_message_id:
-            continue
-        text = (m.raw_text or "").strip()
-        if not text:
-            continue
-        role = "assistant" if m.out else "user"
-        restored.append({"role": role, "content": text})
-    if restored:
-        DIALOGS[chat_id].extend(restored)
-        trim_history(chat_id)
 def calc_confidence(scores: List[torch.Tensor], output_ids: torch.Tensor, prompt_len: int) -> float:
     """
     Оцениваем уверенность как среднее выбранных вероятностей токенов.
@@ -178,7 +177,7 @@ def build_chat_messages(messages: List[dict], who: str) -> List[dict]:
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        if role == "user":
+        if role == "user" and "??? ???????????:" not in content:
             content = USER_INSTRUCTION_TEMPLATE.format(who=who, text=content)
         templated.append({"role": role, "content": content})
     merged = []

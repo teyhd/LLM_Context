@@ -3,6 +3,7 @@ import gc
 import psutil
 import random
 import logging
+import json
 import datetime as dt
 from pathlib import Path
 
@@ -15,17 +16,31 @@ from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizati
                     nvmlDeviceGetTemperature, nvmlDeviceGetMemoryInfo, nvmlShutdown)
 
 # ──────────────────────── Константы ─────────────────────────
-BASE_MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.3"
-LORA_ADAPTER_DIR  = "models/maria/final_adapter" #final_adapter  checkpoint-625
+BASE_MODEL_ID     = os.getenv("BASE_MODEL_ID") or "mistralai/Mistral-7B-Instruct-v0.3"
+LORA_ADAPTER_DIR  = os.getenv("LORA_ADAPTER_DIR") or "models/maria/final_adapter" #final_adapter  checkpoint-625
 
-SYSTEM_PROMPT    = "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
-SYSTEM_PROMPT   = "Ты Машка. Ты дружелюбная и лаконичная девушка.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
-USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
-MAX_CONTEXT_TOKENS = 2048
-MAX_HISTORY_MESSAGES = 40
-ADMIN_ID          = 1975423778
-ADMIN_CHAT_ID     = 1975423778  
-TELEGRAM_TOKEN    = "667589363:AAFIFSIh3Yyy2dyratXGwaCP2bAkc8DI-tY"
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or (
+    "?? ????. ?? ??????????? ? ??????????.\n"
+    "??????? ????? ? ?????????: ??????? ?? ????, ??? ?????? ????."
+)
+USER_INSTRUCTION_TEMPLATE = os.getenv("USER_INSTRUCTION_TEMPLATE") or (
+    "??? ???????????: {who}. ?????? ????? ?? ?????????: {text}"
+)
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS") or "2048")
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES") or "40")
+ADMIN_ID          = int(os.getenv("ADMIN_ID") or "1975423778")
+ADMIN_CHAT_ID     = int(os.getenv("ADMIN_CHAT_ID") or "1975423778")
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN") or "667589363:AAFIFSIh3Yyy2dyratXGwaCP2bAkc8DI-tY"
+
+PROMPT_CONFIG_PATH = os.getenv("PROMPT_CONFIG_PATH") or "config/prompt_config.json"
+if os.path.exists(PROMPT_CONFIG_PATH):
+    try:
+        with open(PROMPT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            _pdata = json.load(f)
+        SYSTEM_PROMPT = _pdata.get("system_prompt") or SYSTEM_PROMPT
+        USER_INSTRUCTION_TEMPLATE = _pdata.get("user_instruction_template") or USER_INSTRUCTION_TEMPLATE
+    except Exception:
+        pass
 
 DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE             = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -118,6 +133,11 @@ DIALOGS = {}                 # user_id → list[dict(role, content)]
 def reset_dialog(uid: int):
     DIALOGS[uid] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+def _count_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
 def trim_history(uid: int) -> list[dict]:
     history = DIALOGS.get(uid, [])
     if not history:
@@ -126,10 +146,17 @@ def trim_history(uid: int) -> list[dict]:
     tail = history[1:]
     if len(tail) > MAX_HISTORY_MESSAGES:
         tail = tail[-MAX_HISTORY_MESSAGES:]
+    if MAX_CONTEXT_TOKENS and tokenizer:
+        tokens = [_count_tokens(m.get("content", "")) for m in tail]
+        total = sum(tokens)
+        start_idx = 0
+        while total > MAX_CONTEXT_TOKENS and start_idx < len(tail):
+            total -= tokens[start_idx]
+            start_idx += 1
+        tail = tail[start_idx:]
     history = head + tail
     DIALOGS[uid] = history
     return history
-
 def build_chat_messages(messages: list[dict], who: str) -> list[dict]:
     """Готовим историю в формате chat_template Mistral и приводим к чередованию user/assistant."""
     templated = []
@@ -138,7 +165,7 @@ def build_chat_messages(messages: list[dict], who: str) -> list[dict]:
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        if role == "user":
+        if role == "user" and "??? ???????????:" not in content:
             content = USER_INSTRUCTION_TEMPLATE.format(who=who, text=content)
         templated.append({"role": role, "content": content})
 

@@ -5,9 +5,10 @@
   "train_file": "train.jsonl",
   "val_file": "val.jsonl",
   "report_file": "report.json",
-  "samples_file": "samples.jsonl",
+  "samples_file": "samples_preview.jsonl",
   "excluded_file": "excluded.jsonl",
   "log_file": "build_dataset.log",
+  "prompt_config": "config/prompt_config.json",
   "system_prompt": "Ты Влад. Ты дружелюбный и лаконичный парень.\nГлавный фокус — переписка: отвечай по делу, без лишней воды.",
   "assistant_names": ["Vs"],
   "assistant_ids": ["user304622290"],
@@ -26,6 +27,8 @@
   "keep_forwarded": false,
   "keep_media_as_tokens": false,
   "media_token": "<MEDIA>",
+  "use_user_name_template": true,
+  "user_instruction_template": "Имя собеседника: {who}. Напиши ответ на сообщение: {text}",
   "pii_policy": "mask",
   "cleaning": {
     "strip_urls": true,
@@ -41,6 +44,10 @@
     "bucket_bits": 12,
     "min_tokens": 8
   },
+  "max_context_tokens": 2048,
+  "max_turn_messages": 40,
+  "stride_tokens": 0,
+  "stride_messages": 4,
   "split": {
     "val_ratio": 0.02,
     "seed": 42,

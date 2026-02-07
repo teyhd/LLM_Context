@@ -12,6 +12,15 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ========================
+# Sliding window defaults
+# ========================
+
+MAX_CONTEXT_TOKENS = 2048
+MAX_TURN_MESSAGES = 40
+STRIDE_TOKENS = 0
+STRIDE_MESSAGES = 4
+
+# ========================
 # Default config (override via --config)
 # ========================
 
@@ -22,9 +31,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "train_file": "train.jsonl",
     "val_file": "val.jsonl",
     "report_file": "report.json",
-    "samples_file": "samples.jsonl",
+    "samples_file": "samples_preview.jsonl",
     "excluded_file": "excluded.jsonl",
     "log_file": "build_dataset.log",
+    "prompt_config": "config/prompt_config.json",
     "system_prompt": (
         "Ты Влад. Ты дружелюбный и лаконичный парень.\n"
         "Главный фокус — переписка: отвечай по делу, без лишней воды."
@@ -58,6 +68,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "keep_forwarded": False,
     "keep_media_as_tokens": False,
     "media_token": "<MEDIA>",
+    "use_user_name_template": True,
+    "user_instruction_template": "Имя собеседника: {who}. Напиши ответ на сообщение: {text}",
     "pii_policy": "mask",  # mask | drop
     "cleaning": {
         "strip_urls": True,
@@ -73,6 +85,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "bucket_bits": 12,
         "min_tokens": 8,
     },
+    "max_context_tokens": MAX_CONTEXT_TOKENS,
+    "max_turn_messages": MAX_TURN_MESSAGES,
+    "stride_tokens": STRIDE_TOKENS,
+    "stride_messages": STRIDE_MESSAGES,
     "split": {
         "val_ratio": 0.02,
         "seed": 42,
@@ -104,13 +120,33 @@ def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]
 def load_config(path: Optional[str]) -> Dict[str, Any]:
     cfg = deepcopy(DEFAULT_CONFIG)
     if not path:
-        return cfg
+        return apply_prompt_config(cfg)
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config not found: {path}")
     with p.open(encoding="utf-8") as f:
         user_cfg = json.load(f)
-    return deep_update(cfg, user_cfg)
+    cfg = deep_update(cfg, user_cfg)
+    return apply_prompt_config(cfg)
+
+
+def apply_prompt_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    path = cfg.get("prompt_config") or os.getenv("PROMPT_CONFIG_PATH")
+    if not path:
+        return cfg
+    p = Path(path)
+    if not p.exists():
+        return cfg
+    try:
+        with p.open(encoding="utf-8") as f:
+            pdata = json.load(f)
+    except Exception:
+        return cfg
+
+    for key in ("system_prompt", "user_instruction_template", "use_user_name_template"):
+        if key in pdata and pdata[key] not in (None, ""):
+            cfg[key] = pdata[key]
+    return cfg
 
 
 def setup_logging(output_dir: Path, log_file: str) -> None:
@@ -249,6 +285,7 @@ def compute_final_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     stats = {
         "assistant_messages": 0,
+        "assistant_targets": 0,
         "user_messages": 0,
         "assistant_tokens": 0,
         "user_tokens": 0,
@@ -290,6 +327,7 @@ def compute_final_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         block_len_messages.append(block_msgs)
 
         if last_ass:
+            stats["assistant_targets"] += 1
             norm_last = normalize_for_dedup(
                 [{"role": "user", "content": ""}, {"role": "assistant", "content": last_ass}]
             )
@@ -307,6 +345,7 @@ def compute_final_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "ratios": {
             "assistant_vs_user_messages": ratio(stats["assistant_messages"], stats["user_messages"]),
+            "assistant_targets_vs_user_messages": ratio(stats["assistant_targets"], stats["user_messages"]),
             "assistant_vs_user_tokens": ratio(stats["assistant_tokens"], stats["user_tokens"]),
             "short_assistant_ratio": None,
         },
@@ -492,11 +531,151 @@ def add_speaker_prefix(messages: List[Dict[str, Any]]) -> None:
             m["content"] = f"[{m['from']}] {m['content']}"
 
 
+def apply_user_name_template(
+    messages: List[Dict[str, Any]],
+    default_name: str,
+    cfg: Dict[str, Any],
+) -> None:
+    if not cfg.get("use_user_name_template"):
+        return
+    template = cfg.get("user_instruction_template")
+    if not template:
+        return
+
+    user_names = {m.get("from") for m in messages if m["role"] == "user" and m.get("from")}
+    if len(user_names) > 1:
+        # multi-user context already handled by add_speaker_prefix
+        return
+
+    for m in messages:
+        if m["role"] != "user":
+            continue
+        who = m.get("from") or default_name
+        content = m["content"]
+        if "Имя собеседника:" in content:
+            continue
+        m["content"] = template.format(who=who, text=content)
+
+
 def is_short_assistant(text: str, cfg: Dict[str, Any]) -> bool:
     if len(text.strip()) < cfg.get("min_assistant_chars", 5):
         return True
     norm = text.strip().lower()
     return norm in cfg.get("short_phrases", [])
+
+
+def trim_context(
+    context: List[Dict[str, Any]],
+    max_messages: int,
+    max_tokens: int,
+) -> List[Dict[str, Any]]:
+    if not context:
+        return []
+
+    start = 0
+    if max_messages and len(context) > max_messages:
+        start = len(context) - max_messages
+
+    tokens = [estimate_tokens(m["content"]) for m in context]
+    total = sum(tokens[start:])
+    while max_tokens and total > max_tokens and start < len(context):
+        total -= tokens[start]
+        start += 1
+
+    trimmed = context[start:]
+    # ensure context starts with user
+    while trimmed and trimmed[0]["role"] == "assistant":
+        trimmed = trimmed[1:]
+
+    # ensure context ends with user
+    while trimmed and trimmed[-1]["role"] != "user":
+        trimmed = trimmed[:-1]
+
+    return trimmed
+
+
+def build_sample_messages(
+    context: List[Dict[str, Any]],
+    target: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Optional[List[Dict[str, str]]]:
+    if not context:
+        return None
+    if not any(m["role"] == "user" for m in context):
+        return None
+    if target.get("role") != "assistant":
+        return None
+
+    msgs = [{"role": "system", "content": cfg["system_prompt"]}]
+    msgs.extend({"role": m["role"], "content": m["content"]} for m in context)
+    msgs.append({"role": "assistant", "content": target["content"]})
+    return msgs
+
+
+def fingerprint_messages(messages: List[Dict[str, str]]) -> str:
+    payload = "||".join(f"{m['role']}:{m['content']}" for m in messages)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+
+def generate_samples_from_block(
+    block: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[List[Tuple[List[Dict[str, str]], str]], Counter]:
+    samples: List[Tuple[List[Dict[str, str]], str]] = []
+    reasons = Counter()
+    seen = set()
+
+    max_messages = int(cfg.get("max_turn_messages", MAX_TURN_MESSAGES))
+    max_tokens = int(cfg.get("max_context_tokens", MAX_CONTEXT_TOKENS))
+    stride_msgs = int(cfg.get("stride_messages", STRIDE_MESSAGES))
+    stride_tokens = int(cfg.get("stride_tokens", STRIDE_TOKENS))
+
+    # baseline sample for each assistant reply
+    for idx, msg in enumerate(block):
+        if msg["role"] != "assistant":
+            continue
+        context = trim_context(block[:idx], max_messages, max_tokens)
+        sample = build_sample_messages(context, msg, cfg)
+        if not sample:
+            reasons["no_context"] += 1
+            continue
+        fp = fingerprint_messages(sample)
+        if fp not in seen:
+            seen.add(fp)
+            samples.append((sample, "baseline"))
+
+    # sliding windows for long dialogs (additional context slices)
+    if stride_msgs > 0 or stride_tokens > 0:
+        start = 0
+        while start < len(block):
+            end = min(start + max_messages, len(block)) if max_messages else len(block)
+            window = block[start:end]
+            # find last assistant in window
+            last_ass_idx = None
+            for i in range(len(window) - 1, -1, -1):
+                if window[i]["role"] == "assistant":
+                    last_ass_idx = i
+                    break
+            if last_ass_idx is not None and last_ass_idx > 0:
+                context = trim_context(window[:last_ass_idx], max_messages, max_tokens)
+                sample = build_sample_messages(context, window[last_ass_idx], cfg)
+                if sample:
+                    fp = fingerprint_messages(sample)
+                    if fp not in seen:
+                        seen.add(fp)
+                        samples.append((sample, "window"))
+
+            if stride_msgs > 0:
+                start += stride_msgs
+            else:
+                token_sum = 0
+                new_start = start
+                while new_start < len(block) and token_sum < stride_tokens:
+                    token_sum += estimate_tokens(block[new_start]["content"])
+                    new_start += 1
+                start = new_start if new_start > start else start + 1
+
+    return samples, reasons
 
 
 def normalize_for_dedup(messages: List[Dict[str, Any]]) -> str:
@@ -640,19 +819,14 @@ def validate_records(records: List[Dict[str, Any]]) -> List[str]:
                 errors.append(f"record {i}: bad role {m.get('role')}")
             if not isinstance(m.get("content"), str) or not m["content"].strip():
                 errors.append(f"record {i}: empty content")
+        if msgs and msgs[-1].get("role") != "assistant":
+            errors.append(f"record {i}: last role not assistant")
     return errors
 
 
 def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    assistant_len_tokens: List[int] = []
-    assistant_len_chars: List[int] = []
-    block_len_tokens: List[int] = []
-    block_len_chars: List[int] = []
-    block_len_messages: List[int] = []
-    duplicate_counter: Counter = Counter()
 
     stats = {
         "messages_total": 0,
@@ -661,18 +835,18 @@ def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "blocks_total": 0,
         "blocks_kept": 0,
         "blocks_dropped": 0,
+        "samples_total": 0,
+        "samples_kept": 0,
+        "samples_dropped": 0,
         "tail_trimmed_blocks": 0,
         "assistant_merges": 0,
         "short_assistant_total": 0,
         "short_assistant_kept": 0,
         "dedup_exact_removed": 0,
         "dedup_near_removed": 0,
-        "assistant_messages": 0,
-        "user_messages": 0,
-        "assistant_tokens": 0,
-        "user_tokens": 0,
-        "assistant_chars": 0,
-        "user_chars": 0,
+        "short_assistant_downsampled": 0,
+        "short_assistant_dropped": 0,
+        "sample_reasons": Counter(),
         "reasons": Counter(),
         "per_person": {},
         "duplicates": [],
@@ -699,6 +873,9 @@ def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "blocks_total": 0,
                 "blocks_kept": 0,
                 "blocks_dropped": 0,
+                "samples_total": 0,
+                "samples_kept": 0,
+                "samples_dropped": 0,
             },
         )
 
@@ -773,53 +950,51 @@ def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             add_speaker_prefix(compact)
-
-            last_ass = [m for m in compact if m["role"] == "assistant"][-1]
-            if is_short_assistant(last_ass["content"], cfg):
-                stats["short_assistant_total"] += 1
-                keep = cfg.get("keep_short_assistants", True)
-                if keep and random.random() <= cfg.get("short_assistant_keep_prob", 0.35):
-                    stats["short_assistant_kept"] += 1
-                elif keep:
-                    stats["blocks_dropped"] += 1
-                    pstats["blocks_dropped"] += 1
-                    stats["reasons"]["short_assistant_downsampled"] += 1
-                    continue
-                else:
-                    stats["blocks_dropped"] += 1
-                    pstats["blocks_dropped"] += 1
-                    stats["reasons"]["short_assistant_dropped"] += 1
-                    continue
-
+            apply_user_name_template(compact, name, cfg)
             stats["blocks_kept"] += 1
             pstats["blocks_kept"] += 1
 
-            for m in compact:
-                if m["role"] == "assistant":
-                    stats["assistant_messages"] += 1
-                    t = estimate_tokens(m["content"])
-                    c = len(m["content"])
-                    stats["assistant_tokens"] += t
-                    stats["assistant_chars"] += c
-                elif m["role"] == "user":
-                    stats["user_messages"] += 1
-                    stats["user_tokens"] += estimate_tokens(m["content"])
-                    stats["user_chars"] += len(m["content"])
+            samples, sample_reasons = generate_samples_from_block(compact, cfg)
+            stats["sample_reasons"].update(sample_reasons)
 
-            record = {
-                "messages": [{"role": "system", "content": cfg["system_prompt"]}]
-                + [{"role": m["role"], "content": m["content"]} for m in compact],
-                "meta": {
-                    "dialog_id": f"{path.stem}:{compact[0].get('id')}",
-                    "source_file": path.name,
-                    "participant": name,
-                    "time_start": compact[0]["time"].isoformat(),
-                    "time_end": compact[-1]["time"].isoformat(),
-                },
-            }
-            records.append(record)
+            for s_idx, (sample_msgs, sample_type) in enumerate(samples):
+                stats["samples_total"] += 1
+                pstats["samples_total"] += 1
 
-    logging.info("Collected %d blocks before dedup", len(records))
+                target_text = sample_msgs[-1]["content"]
+                if is_short_assistant(target_text, cfg):
+                    stats["short_assistant_total"] += 1
+                    keep = cfg.get("keep_short_assistants", True)
+                    if keep and random.random() <= cfg.get("short_assistant_keep_prob", 0.35):
+                        stats["short_assistant_kept"] += 1
+                    elif keep:
+                        stats["samples_dropped"] += 1
+                        pstats["samples_dropped"] += 1
+                        stats["short_assistant_downsampled"] += 1
+                        continue
+                    else:
+                        stats["samples_dropped"] += 1
+                        pstats["samples_dropped"] += 1
+                        stats["short_assistant_dropped"] += 1
+                        continue
+
+                record = {
+                    "messages": sample_msgs,
+                    "meta": {
+                        "dialog_id": f"{path.stem}:{compact[0].get('id')}",
+                        "source_file": path.name,
+                        "participant": name,
+                        "sample_type": sample_type,
+                        "sample_index": s_idx,
+                        "time_start": compact[0]["time"].isoformat(),
+                        "time_end": compact[-1]["time"].isoformat(),
+                    },
+                }
+                records.append(record)
+                stats["samples_kept"] += 1
+                pstats["samples_kept"] += 1
+
+    logging.info("Collected %d samples before dedup", len(records))
     records = deduplicate(records, cfg, stats)
     logging.info(
         "After dedup: %d kept (exact removed=%d, near removed=%d)",
@@ -830,7 +1005,7 @@ def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     final_metrics = compute_final_metrics(records)
     final_metrics["ratios"]["short_assistant_ratio"] = ratio(
-        stats["short_assistant_total"], final_metrics["stats"]["assistant_messages"]
+        stats["short_assistant_total"], final_metrics["stats"]["assistant_targets"]
     )
 
     train, val = split_train_val(records, cfg)
@@ -875,7 +1050,7 @@ def build_dataset(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Telegram SFT dataset builder")
     parser.add_argument("--config", help="Path to JSON config", default=None)
-    parser.add_argument("--dry_run", type=int, help="Write N samples to samples.jsonl", default=None)
+    parser.add_argument("--dry_run", type=int, help="Write N samples to samples_preview.jsonl", default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)

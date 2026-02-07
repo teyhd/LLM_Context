@@ -15,8 +15,12 @@ python "1. Dataset_Builder.py" --config config/dataset_config.json
 Artifacts:
 - `data/output/train.jsonl`, `data/output/val.jsonl`
 - `data/output/report.json` (dataset stats + exclusions)
-- `data/output/samples.jsonl` (N random samples if `dry_run > 0`)
+- `data/output/samples_preview.jsonl` (N random samples if `dry_run > 0`)
 - `data/output/excluded.jsonl` (dropped messages)
+
+Key dataset window params (in `config/dataset_config.json`):
+- `max_context_tokens`, `max_turn_messages`
+- `stride_messages` / `stride_tokens`
 
 2) Train LoRA/QLoRA
 ```
@@ -31,6 +35,11 @@ Artifacts (per run):
 - `models/vlad_YYYYMMDD_HHMMSS/train_config.json`
 
 Resume: set `"run_dir": "models/vlad_YYYYMMDD_HHMMSS"` in the config and re-run.
+
+Profiles (config/train_config.json):
+- `profile: quality | balanced | economy`
+- `lora_target_modules: "auto"` chooses attention-only vs full modules by dataset size
+- `sanity_dialogs`: optional multi-turn checks saved to `sanity_checks.json`
 
 ## Inference (adapter)
 

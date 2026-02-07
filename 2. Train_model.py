@@ -1,538 +1,584 @@
-# ───────────────────────────────────────────────────────────────────────
-import os, csv, json, math, random, logging, warnings
+import argparse
+import json
+import logging
+import math
+import os
+import random
+import shutil
+import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
-import torch.serialization
-import numpy.core.multiarray
-
-torch.serialization.add_safe_globals([numpy.core.multiarray._reconstruct])
-
 from datasets import Dataset
 from transformers import (
-    AutoTokenizer,
     AutoModelForCausalLM,
-    TrainingArguments,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    EarlyStoppingCallback,
     Trainer,
     TrainerCallback,
-    EarlyStoppingCallback,
-    TrainerState,
+    TrainingArguments,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
-# ─── ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ ────────────────────────────────────────────
+# ========================
+# Default config
+# ========================
 
-MODEL_ID               = "mistralai/Mistral-7B-Instruct-v0.3"
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "model_id": "mistralai/Mistral-7B-Instruct-v0.3",
+    "data_dir": "data/output",
+    "train_file": "train.jsonl",
+    "val_file": "val.jsonl",
+    "output_dir": "models",
+    "run_name": "vlad",
+    "run_dir": "",
+    "resume": True,
+    "seed": 42,
+    "num_epochs": 2,
+    "per_device_train_batch_size": 2,
+    "per_device_eval_batch_size": 2,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 2e-5,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "max_seq_len": 2048,
+    "max_answer_tokens": 1024,
+    "max_grad_norm": 0.3,
+    "use_fp16": True,
+    "use_bf16": "auto",
+    "gradient_checkpointing": True,
+    "use_4bit": True,
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_use_double_quant": True,
+    "bnb_4bit_compute_dtype": "float16",
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "lora_target_modules": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "save_steps": 200,
+    "eval_steps": 200,
+    "save_total_limit": 4,
+    "logging_steps": 10,
+    "early_stopping_patience": 20,
+    "report_to": [],
+    "optim": "auto",
+    "group_by_length": True,
+    "generate_interval": 0,
+    "max_gen_tokens": 128,
+    "temperature": 0.6,
+    "top_p": 0.9,
+    "repetition_penalty": 1.1,
+    "no_repeat_ngram_size": 3,
+    "sample_prompts": [],
+    "assistant_turns": "all",  # all | last
+    "max_samples_per_dialog": 0,
+    "notify_url": "",
+    "save_merged": False,
+}
 
-DATA_DIR               = "data/output"
-TRAIN_FILE             = "train.jsonl"
-VAL_FILE               = "valid.jsonl"
 
-OUTPUT_DIR             = "models"
-# фиксированное имя прогона, совпадает с ботом
-RUN_NAME               = "vlad7"
+def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
 
-NOTIFY_URL             = "http://home.teyhd.ru:3334/"
 
-NUM_EPOCHS             = 3
-BATCH_SIZE             = 2
-GRAD_ACC               = 4
-LEARNING_RATE          = 2e-5
+def load_config(path: Optional[str]) -> Dict[str, Any]:
+    cfg = DEFAULT_CONFIG.copy()
+    if not path:
+        return cfg
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+    with p.open(encoding="utf-8") as f:
+        user_cfg = json.load(f)
+    return deep_update(cfg, user_cfg)
 
-WARMUP_FRAC            = 0.05
-WEIGHT_DECAY           = 0.01
-MAX_SEQ_LEN            = 2048
-MAX_GRAD_NORM          = 0.3
 
-LORA_R                 = 32#8
-LORA_ALPHA             = 32#16
-LORA_DROPOUT           = 0.15#15
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-# Блоки, к которым будет применяться LoRA (типичный набор для Mistral)
-TARGET_MODULES = [
-    "q_proj",
-   # "k_proj",
-    "v_proj",
-    #"o_proj",
-    "gate_proj",
-   # "up_proj",
-   # "down_proj",
-]
-LORA_R = 64              # Увеличиваем ранг для лучшего захвата нюансов стиля
-LORA_ALPHA = 128         # Alpha = 2 * R (золотой стандарт стабильности)
-LORA_DROPOUT = 0.05      # 0.25 — слишком много, модель будет недообучаться.
-                         # Для шума лучше 0.05-0.1, не больше.
-# Для Mistral/Llama лучше обучать ВСЕ линейные слои,
-# чтобы стиль "пропитался" и в Attention, и в MLP (где хранятся знания/паттерны)
-TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
 
-SAVE_STEPS             = 200
-EVAL_STEPS             = 200
-SAVE_LIMIT             = 4
-EARLY_PATIENCE         = 20   # реальная ранняя остановка
+def setup_logging(run_dir: Path) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_file = run_dir / "train.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(log_file, "w", "utf-8"), logging.StreamHandler()],
+    )
+    warnings.filterwarnings("ignore", category=FutureWarning)
 
-LOG_STEPS              = 5
-CSV_METRICS            = True
-CSV_FILE               = "metrics.csv"
-LOSS_ALERT             = 5.0
 
-GEN_INTERVAL           = 25
-MAX_GEN_TOKENS         = 128
-TEMPERATURE            = 0.5
-TOP_P                  = 0.95
-
-REPETITION_PENALTY = 1.2   # 1.1–1.3
-NO_REPEAT_NGRAM_SIZE = 3   # 3–6
-
-ANALYTICS_STEPS        = 5  # шаги, через которые шлём короткую сводку
-
-SEED                   = 42
-
-USE_FP16               = True
-USE_BF16               = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-GRADIENT_CHECKPOINTING = True
-REPORT_TO_WANDB        = False
-
-# reproducibility & env
-random.seed(SEED)
-torch.manual_seed(SEED)
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-torch.backends.cuda.matmul.allow_tf32 = True
-
-# ─── Уведомления ──────────────────────────────────────────────────────
-def notify(msg: str) -> None:
-    if not NOTIFY_URL:
+def notify(url: str, msg: str) -> None:
+    if not url:
         return
     try:
         import requests
-        print(msg)
-        requests.get(NOTIFY_URL, params={"msg": f"SRV: {msg[:1000]}"})
-    except Exception as e:                                     # noqa: BLE001
-        logging.warning(f"notify failed: {e}")
 
-# ─── Логирование ──────────────────────────────────────────────────────
-OUT_DIR = Path(OUTPUT_DIR) / RUN_NAME
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = OUT_DIR / "train.log"
+        requests.get(url, params={"msg": msg[:1000]})
+    except Exception as e:  # noqa: BLE001
+        logging.warning("notify failed: %s", e)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, "w", "utf-8"), logging.StreamHandler()],
-)
-warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ─── Tokenizer ────────────────────────────────────────────────────────
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=False)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-eos_id = tokenizer.eos_token_id
+def log_env(run_dir: Path) -> None:
+    import transformers
+    import datasets
+    import peft
 
-# ─── Helpers ──────────────────────────────────────────────────────────
-def read_jsonl(path: Path) -> List[Dict]:
+    env = {
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "transformers": transformers.__version__,
+        "datasets": datasets.__version__,
+        "peft": peft.__version__,
+        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    }
+    try:
+        import bitsandbytes as bnb
+
+        env["bitsandbytes"] = bnb.__version__
+    except Exception:
+        env["bitsandbytes"] = None
+    with (run_dir / "env.json").open("w", encoding="utf-8") as f:
+        json.dump(env, f, indent=2)
+
+
+def preflight(cfg: Dict[str, Any], run_dir: Path) -> None:
+    data_dir = Path(cfg["data_dir"])
+    train_path = data_dir / cfg["train_file"]
+    val_path = data_dir / cfg["val_file"]
+    if not train_path.exists():
+        raise FileNotFoundError(f"Train file missing: {train_path}")
+    if not val_path.exists():
+        logging.warning("Val file missing: %s", val_path)
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        logging.info("GPU: %s | VRAM: %.1f GB", props.name, props.total_memory / 1e9)
+    else:
+        logging.warning("CUDA not available; training on CPU will be slow")
+
+    usage = shutil.disk_usage(run_dir)
+    logging.info("Disk free: %.1f GB", usage.free / 1e9)
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows = []
+    if not path.exists():
+        return rows
     with path.open(encoding="utf-8") as f:
-        return [json.loads(l) for l in f]
-
-def format_chat(messages: List[Dict]) -> (str, str):
-    """
-    Готовим prompt через штатный шаблон Mistral, ответ — последний assistant.
-    """
-    ass_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
-    if not ass_indices:
-        return "", ""
-
-    last_ass_idx = ass_indices[-1]
-    answer = messages[last_ass_idx]["content"].strip()
-    if not answer:
-        return "", ""
-
-    def to_alternating(msgs: List[Dict]) -> List[Dict]:
-        # Склеиваем подряд идущие роли и убираем пустое содержимое
-        merged = []
-        for m in msgs:
-            content = m["content"].strip()
-            if not content:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            role = m["role"]
-            if merged and merged[-1]["role"] == role:
-                merged[-1]["content"] += "\n" + content
-            else:
-                merged.append({"role": role, "content": content})
+            rows.append(json.loads(line))
+    return rows
 
-        # Оставляем только первый system, если он есть
-        has_system = merged and merged[0]["role"] == "system"
-        core = merged[1:] if has_system else merged
 
-        # Убираем ведущие assistant, чтобы диалог начинался с user
-        while core and core[0]["role"] == "assistant":
-            core = core[1:]
+def normalize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    for m in messages:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in {"system", "user", "assistant"} or not content:
+            continue
+        if cleaned and cleaned[-1]["role"] == role:
+            cleaned[-1]["content"] += "\n" + content
+        else:
+            cleaned.append({"role": role, "content": content})
 
-        # Гарантируем чередование user/assistant
-        alternated = [{"role": "system", "content": merged[0]["content"]}] if has_system else []
-        for m in core:
-            if not alternated:
-                if m["role"] == "assistant":
-                    continue
-                alternated.append(m)
-                continue
-            if alternated[-1]["role"] == m["role"]:
-                alternated[-1]["content"] += "\n" + m["content"]
-            else:
-                alternated.append(m)
+    if not cleaned:
+        return []
 
-        # Обрезаем хвост, чтобы закончить на user (требование шаблона)
-        while alternated and alternated[-1]["role"] != "user":
-            alternated.pop()
-        return alternated
+    # keep only first system message
+    if cleaned[0]["role"] == "system":
+        sys_msg = cleaned[0]
+        rest = [m for m in cleaned[1:] if m["role"] != "system"]
+        cleaned = [sys_msg] + rest
+    else:
+        cleaned = [m for m in cleaned if m["role"] != "system"]
 
-    chat_ctx = to_alternating(messages[:last_ass_idx])
-    if not chat_ctx:
-        return "", ""
+    # remove leading assistant
+    while cleaned and cleaned[0]["role"] == "assistant":
+        cleaned.pop(0)
 
-    prompt = tokenizer.apply_chat_template(
-        chat_ctx,
+    return cleaned
+
+
+def build_prompt(
+    tokenizer: AutoTokenizer,
+    context: List[Dict[str, str]],
+) -> str:
+    if not context:
+        return ""
+    # ensure context ends with user
+    while context and context[-1]["role"] != "user":
+        context = context[:-1]
+    if not context:
+        return ""
+    return tokenizer.apply_chat_template(
+        context,
         tokenize=False,
         add_generation_prompt=True,
     )
-    return prompt, answer
 
-def build_dataset(raw: List[Dict]) -> Dataset:
-    samples = []
-    for rec in raw:
-        msgs = rec["messages"]
-        # Требуем, чтобы последний в списке был ассистентом
-        if len(msgs) < 2 or msgs[-1]["role"] != "assistant":
+
+def iter_targets(messages: List[Dict[str, str]], mode: str) -> Iterable[Tuple[List[Dict[str, str]], str]]:
+    indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+    if not indices:
+        return []
+    if mode == "last":
+        indices = [indices[-1]]
+    for idx in indices:
+        ctx = messages[:idx]
+        ans = messages[idx]["content"].strip()
+        if ans:
+            yield ctx, ans
+
+
+def build_samples(
+    records: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    tokenizer: AutoTokenizer,
+) -> Dataset:
+    max_seq_len = int(cfg["max_seq_len"])
+    max_answer_tokens = int(cfg.get("max_answer_tokens") or max_seq_len)
+    assistant_turns = cfg.get("assistant_turns", "all")
+    max_per_dialog = int(cfg.get("max_samples_per_dialog") or 0)
+
+    samples: List[Dict[str, Any]] = []
+    eos_id = tokenizer.eos_token_id
+
+    for rec in records:
+        msgs = normalize_messages(rec.get("messages", []))
+        if len(msgs) < 2:
             continue
 
-        prompt, answer = format_chat(msgs)
-        if not prompt or not answer:
-            continue
+        turns = list(iter_targets(msgs, assistant_turns))
+        if max_per_dialog and len(turns) > max_per_dialog:
+            turns = turns[-max_per_dialog:]
 
-        prompt_ids = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-            add_special_tokens=False,
-        ).input_ids
-        answer_ids = tokenizer(
-            answer,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-            add_special_tokens=False,
-        ).input_ids
-
-        max_prompt_len = MAX_SEQ_LEN - len(answer_ids) - 1
-        if max_prompt_len <= 0:
-            # Ответ сам по себе больше лимита — режем его, чтобы не терять выборку
-            answer_ids = answer_ids[: MAX_SEQ_LEN - 1]
-            prompt_chunks = [[]]
-        else:
-            # Разбиваем длинный prompt на окна, чтобы не терять контекст
-            prompt_chunks = []
-            if not prompt_ids:
-                prompt_chunks = [[]]
-            elif len(prompt_ids) <= max_prompt_len:
-                prompt_chunks = [prompt_ids]
-            else:
-                stride = max(max_prompt_len // 2, 1)
-                n = len(prompt_ids)
-                start = 0
-                while start < n:
-                    chunk = prompt_ids[start:start + max_prompt_len]
-                    prompt_chunks.append(chunk)
-                    if start + max_prompt_len >= n:
-                        break
-                    start += stride
-                tail = prompt_ids[-max_prompt_len:]
-                if prompt_chunks and prompt_chunks[-1] != tail:
-                    prompt_chunks.append(tail)
-
-        for chunk in prompt_chunks:
-            input_ids = chunk + answer_ids + [eos_id]
-            if len(input_ids) > MAX_SEQ_LEN:
+        for ctx, answer in turns:
+            ctx = normalize_messages(ctx)
+            prompt = build_prompt(tokenizer, ctx)
+            if not prompt:
                 continue
-            labels = [-100] * len(chunk) + answer_ids + [eos_id]
+
+            prompt_ids = tokenizer(
+                prompt,
+                truncation=False,
+                add_special_tokens=False,
+            ).input_ids
+            answer_ids = tokenizer(
+                answer,
+                truncation=True,
+                max_length=max_answer_tokens,
+                add_special_tokens=False,
+            ).input_ids
+
+            max_prompt_len = max_seq_len - len(answer_ids) - 1
+            if max_prompt_len <= 0:
+                answer_ids = answer_ids[: max_seq_len - 1]
+                prompt_ids = []
+            elif len(prompt_ids) > max_prompt_len:
+                prompt_ids = prompt_ids[-max_prompt_len:]
+
+            input_ids = prompt_ids + answer_ids + [eos_id]
+            if len(input_ids) > max_seq_len:
+                continue
+
+            labels = [-100] * len(prompt_ids) + answer_ids + [eos_id]
             samples.append(
                 {
-                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                    "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
+                    "input_ids": input_ids,
+                    "attention_mask": [1] * len(input_ids),
+                    "labels": labels,
+                    "length": len(input_ids),
                 }
             )
 
     if not samples:
-        logging.warning("⚠️ build_dataset: no valid samples constructed")
+        logging.warning("build_samples produced no data")
         return Dataset.from_list([])
 
-    return Dataset.from_list(samples).with_format("torch")
+    ds = Dataset.from_list(samples)
+    return ds.with_format("torch")
 
-# ─── Data ─────────────────────────────────────────────────────────────
-train_raw = read_jsonl(Path(DATA_DIR) / TRAIN_FILE)
-val_raw   = read_jsonl(Path(DATA_DIR) / VAL_FILE)
 
-train_ds  = build_dataset(train_raw)
-val_ds    = build_dataset(val_raw)
+def build_model_and_tokenizer(cfg: Dict[str, Any]):
+    model_id = cfg["model_id"]
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-logging.info(f"📊 samples → {len(train_ds)} train • {len(val_ds)} val")
+    use_bf16 = cfg["use_bf16"]
+    if use_bf16 == "auto":
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = cfg.get("use_fp16", True)
 
-# ─── Model + LoRA ─────────────────────────────────────────────────────
-base_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.bfloat16 if USE_BF16 else (torch.float16 if USE_FP16 else torch.float32),
-    device_map="auto",
-)
-base_model.resize_token_embeddings(len(tokenizer))
-base_model.config.use_cache = False
-if GRADIENT_CHECKPOINTING:
-    base_model.gradient_checkpointing_enable()
+    torch_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else torch.float32)
 
-lora_cfg = LoraConfig(
-    r=LORA_R,
-    lora_alpha=LORA_ALPHA,
-    lora_dropout=LORA_DROPOUT,
-    target_modules=TARGET_MODULES,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM,
-)
-model = get_peft_model(base_model, lora_cfg)
-model.print_trainable_parameters()
+    quant_cfg = None
+    if cfg.get("use_4bit"):
+        compute_dtype = torch.float16 if cfg.get("bnb_4bit_compute_dtype") == "float16" else torch.bfloat16
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=cfg.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_use_double_quant=cfg.get("bnb_4bit_use_double_quant", True),
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
 
-# ─── Callbacks ────────────────────────────────────────────────────────
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        quantization_config=quant_cfg,
+    )
+    model.config.use_cache = False
+    if cfg.get("gradient_checkpointing"):
+        model.gradient_checkpointing_enable()
+    if cfg.get("use_4bit"):
+        model = prepare_model_for_kbit_training(model)
+
+    lora_cfg = LoraConfig(
+        r=cfg["lora_r"],
+        lora_alpha=cfg["lora_alpha"],
+        lora_dropout=cfg["lora_dropout"],
+        target_modules=cfg["lora_target_modules"],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
+
+    return model, tokenizer
+
+
 class CSVLogger(TrainerCallback):
-    def __init__(self):
+    def __init__(self, path: Path):
+        self.path = path
         self.columns = ["step"]
         self.header_written = False
 
-    def _read_existing_header(self, csv_path: Path) -> None:
-        if self.header_written or not csv_path.exists():
-            return
-        try:
-            with csv_path.open(newline="", encoding="utf-8") as f:
-                header = next(csv.reader(f), None)
-            if header:
-                self.columns = list(header)
-                self.header_written = True
-        except Exception as e:  # noqa: BLE001
-            logging.warning("csv header read failed: %s", e)
-
     def on_log(self, args, state, control, logs=None, **kw):
-        if not CSV_METRICS or not logs:
+        if not logs:
             return
-        csv_path = OUT_DIR / CSV_FILE
-        self._read_existing_header(csv_path)
         for key in logs:
             if key not in self.columns:
                 self.columns.append(key)
-        with csv_path.open("a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=self.columns)
+        with self.path.open("a", newline="", encoding="utf-8") as f:
             if not self.header_written:
-                w.writeheader()
+                f.write(",".join(self.columns) + "\n")
                 self.header_written = True
             row = {"step": state.global_step}
-            for key in self.columns:
-                if key == "step":
-                    continue
-                row[key] = logs.get(key)
-            w.writerow(row)
-        if logs.get("loss", 0) > LOSS_ALERT:
-            notify(f"⚠️ loss {state.global_step}: {logs['loss']:.2f}")
-        if state.global_step and state.global_step % ANALYTICS_STEPS == 0:
-            loss = logs.get("loss")
-            eval_loss = logs.get("eval_loss")
-            lr = logs.get("learning_rate")
-            parts = [f"step {state.global_step}"]
-            if loss is not None:
-                parts.append(f"loss={loss:.3f}")
-            if eval_loss is not None:
-                parts.append(f"eval={eval_loss:.3f}")
-            if lr is not None:
-                parts.append(f"lr={lr:.2e}")
-            msg = " | ".join(parts)
-            logging.info(msg)
-            notify(msg)
+            row.update({k: logs.get(k, "") for k in self.columns if k != "step"})
+            f.write(",".join(str(row.get(k, "")) for k in self.columns) + "\n")
 
-class SaveAdapter(TrainerCallback):
+
+class SaveAdapterCallback(TrainerCallback):
     def on_save(self, args, state, control, **kw):
-        p = Path(args.output_dir) / f"checkpoint-{state.global_step}" / "adapter"
-        p.mkdir(parents=True, exist_ok=True)
-        kw["model"].save_pretrained(p)
-        logging.info(f"💾 adapter saved at step {state.global_step}")
-        notify(f"💾 checkpoint {state.global_step}")
-
-class StartEndNotify(TrainerCallback):
-    def on_train_begin(self, *a, **kw):
-        notify("🚀 Старт обучения")
-
-    def on_train_end(self, *a, **kw):
-        notify("✅ Обучение завершено")
-
-    def on_evaluate(self, args, state, control, metrics=None, **kw):
-        if metrics and "eval_loss" in metrics:
-            notify(f"📉 eval {state.global_step}: {metrics['eval_loss']:.4f}")
-
-class RandomGenerateNotify(TrainerCallback):
-    def __init__(self, data: List[Dict], interval: int = GEN_INTERVAL):
-        self.data = data
-        self.interval = interval
-
-    def safe_generate(self, prompt_text: str) -> str:
-        try:
-            enc = tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=MAX_SEQ_LEN,
-            )
-            prompt_ids = enc.input_ids
-            attn_mask = enc.attention_mask
-            if prompt_ids.numel() == 0:
-                return "[SKIP: empty prompt]"
-
-            prompt_ids = prompt_ids.to(model.device)
-            attn_mask = attn_mask.to(model.device)
-            model.eval()
-
-            with torch.no_grad():
-                out = model.generate(
-                    prompt_ids,
-                    attention_mask=attn_mask,
-                    max_new_tokens=MAX_GEN_TOKENS,
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    repetition_penalty = REPETITION_PENALTY,
-                    no_repeat_ngram_size = NO_REPEAT_NGRAM_SIZE,
-                    pad_token_id=eos_id,
-                    eos_token_id=eos_id,
-                    do_sample=True,
-                )
-
-            return tokenizer.decode(
-                out[0][prompt_ids.shape[-1]:],
-                skip_special_tokens=True,
-            )
-
-        except RuntimeError as e:
-            if "CUDA error" in str(e) or "device-side assert" in str(e):
-                logging.warning(f"[GEN FAIL] CUDA error: {e}")
-                notify(f"⚠️ Ошибка генерации: {e}")
-                return "[GENERATION FAILED]"
-            raise
-
-    def on_step_end(self, args, state: TrainerState, control, **kwargs):
-        if state.global_step == 0 or state.global_step % self.interval != 0:
+        model = kw.get("model")
+        if not model:
             return
+        ckpt_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}" / "adapter"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(ckpt_dir)
+        logging.info("Adapter saved: %s", ckpt_dir)
 
-        rec = random.choice(self.data)
-        prompt, gold = format_chat(rec["messages"])
+
+class SampleGenerateCallback(TrainerCallback):
+    def __init__(self, tokenizer, model, samples: List[str], interval: int, cfg: Dict[str, Any], notify_url: str):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.samples = samples
+        self.interval = interval
+        self.cfg = cfg
+        self.notify_url = notify_url
+
+    def _generate(self, prompt: str) -> str:
+        enc = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.cfg["max_seq_len"])
+        input_ids = enc.input_ids.to(self.model.device)
+        attn_mask = enc.attention_mask.to(self.model.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                input_ids,
+                attention_mask=attn_mask,
+                max_new_tokens=self.cfg["max_gen_tokens"],
+                temperature=self.cfg["temperature"],
+                top_p=self.cfg["top_p"],
+                repetition_penalty=self.cfg["repetition_penalty"],
+                no_repeat_ngram_size=self.cfg["no_repeat_ngram_size"],
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        return self.tokenizer.decode(out[0][input_ids.shape[-1]:], skip_special_tokens=True)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.interval <= 0 or state.global_step == 0 or state.global_step % self.interval != 0:
+            return
+        prompt = random.choice(self.samples) if self.samples else None
         if not prompt:
             return
+        gen = self._generate(prompt)
+        msg = f"[GEN step {state.global_step}]\\nPROMPT: {prompt}\\nGEN: {gen}"
+        logging.info(msg)
+        notify(self.notify_url, msg)
 
-        # Берём последний user перед ответом для отчёта
-        last_user = ""
-        for m in reversed(rec["messages"]):
-            if m.get("role") == "user":
-                last_user = m.get("content", "").strip()
-                break
 
-        gen = self.safe_generate(prompt)
-        notify(
-            f"🎙 {state.global_step}\nUSER: {last_user}\nGOLD: {gold}\nGEN: {gen}\nPROMPT: {prompt}"
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SFT training for Mistral")
+    parser.add_argument("--config", help="Path to JSON config", default=None)
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    seed_everything(int(cfg["seed"]))
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = cfg["run_name"]
+    if cfg.get("run_dir"):
+        run_dir = Path(cfg["run_dir"])
+    else:
+        run_dir = Path(cfg["output_dir"]) / f"{run_name}_{timestamp}"
+    setup_logging(run_dir)
+    preflight(cfg, run_dir)
+
+    with (run_dir / "train_config.json").open("w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    log_env(run_dir)
+
+    train_raw = read_jsonl(Path(cfg["data_dir"]) / cfg["train_file"])
+    val_raw = read_jsonl(Path(cfg["data_dir"]) / cfg["val_file"])
+
+    model, tokenizer = build_model_and_tokenizer(cfg)
+    train_ds = build_samples(train_raw, cfg, tokenizer)
+    val_ds = build_samples(val_raw, cfg, tokenizer) if val_raw else Dataset.from_list([])
+
+    logging.info("Samples: %d train | %d val", len(train_ds), len(val_ds))
+
+    updates = math.ceil(len(train_ds) / cfg["per_device_train_batch_size"] / cfg["gradient_accumulation_steps"]) * cfg["num_epochs"] if len(train_ds) > 0 else 0
+    warmup_steps = max(10, int(updates * cfg["warmup_ratio"])) if updates > 0 else 0
+
+    use_bf16 = cfg["use_bf16"]
+    if use_bf16 == "auto":
+        use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+    optim = cfg.get("optim", "auto")
+    if optim == "auto":
+        optim = "paged_adamw_8bit" if cfg.get("use_4bit") else "adamw_torch_fused"
+
+    eval_strategy = "steps" if len(val_ds) > 0 else "no"
+    save_strategy = "steps" if cfg.get("save_steps") else "no"
+
+    args = TrainingArguments(
+        output_dir=str(run_dir),
+        run_name=run_name,
+        seed=int(cfg["seed"]),
+        num_train_epochs=cfg["num_epochs"],
+        per_device_train_batch_size=cfg["per_device_train_batch_size"],
+        per_device_eval_batch_size=cfg["per_device_eval_batch_size"],
+        gradient_accumulation_steps=cfg["gradient_accumulation_steps"],
+        learning_rate=cfg["learning_rate"],
+        weight_decay=cfg["weight_decay"],
+        warmup_steps=warmup_steps,
+        lr_scheduler_type="cosine",
+        fp16=cfg.get("use_fp16", True) and not use_bf16,
+        bf16=use_bf16,
+        max_grad_norm=cfg["max_grad_norm"],
+        logging_steps=cfg["logging_steps"],
+        evaluation_strategy=eval_strategy,
+        eval_steps=cfg["eval_steps"],
+        save_strategy=save_strategy,
+        save_steps=cfg["save_steps"],
+        save_total_limit=cfg["save_total_limit"],
+        load_best_model_at_end=bool(len(val_ds)),
+        group_by_length=cfg.get("group_by_length", True),
+        optim=optim,
+        report_to=cfg.get("report_to", []),
+        save_safetensors=True,
+    )
+
+    def collate(batch):
+        pad_id = tokenizer.pad_token_id
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            [x["input_ids"] for x in batch], batch_first=True, padding_value=pad_id
+        )
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            [x["attention_mask"] for x in batch], batch_first=True, padding_value=0
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(
+            [x["labels"] for x in batch], batch_first=True, padding_value=-100
+        )
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    callbacks: List[TrainerCallback] = [
+        CSVLogger(run_dir / "metrics.csv"),
+        SaveAdapterCallback(),
+    ]
+    if cfg.get("early_stopping_patience") and len(val_ds) > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=cfg["early_stopping_patience"]))
+
+    if cfg.get("generate_interval", 0) > 0 and cfg.get("sample_prompts"):
+        callbacks.append(
+            SampleGenerateCallback(
+                tokenizer,
+                model,
+                cfg["sample_prompts"],
+                cfg["generate_interval"],
+                cfg,
+                cfg.get("notify_url", ""),
+            )
         )
 
-# ─── TrainingArguments ───────────────────────────────────────────────
-updates = math.ceil(len(train_ds) / BATCH_SIZE / GRAD_ACC) * NUM_EPOCHS if len(train_ds) > 0 else 0
-warmup  = max(10, int(updates * WARMUP_FRAC)) if updates > 0 else 0
-
-args = TrainingArguments(
-    output_dir=str(OUT_DIR),
-    run_name=RUN_NAME,
-    seed=SEED,
-
-    num_train_epochs=NUM_EPOCHS,
-    per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=2,
-    gradient_accumulation_steps=GRAD_ACC,
-    learning_rate=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-    warmup_steps=warmup,
-    lr_scheduler_type="cosine",
-
-    fp16=USE_FP16 and not USE_BF16,
-    bf16=USE_BF16,
-    max_grad_norm=MAX_GRAD_NORM,
-
-    logging_steps=LOG_STEPS,
-
-    eval_strategy="steps",
-    eval_steps=EVAL_STEPS,
-
-    save_strategy="steps",
-    save_steps=SAVE_STEPS,
-    save_total_limit=SAVE_LIMIT,
-    load_best_model_at_end=True,
-    group_by_length=True,
-    eval_accumulation_steps=4,
-
-    optim="adamw_torch_fused",
-    report_to=[] if not REPORT_TO_WANDB else ["wandb"],
-    save_safetensors=True,
-)
-
-# ─── Data Collator ───────────────────────────────────────────────────
-def collate(batch):
-    pad_id = tokenizer.pad_token_id
-    input_ids      = torch.nn.utils.rnn.pad_sequence(
-        [x["input_ids"] for x in batch], batch_first=True, padding_value=pad_id
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds if len(val_ds) > 0 else None,
+        data_collator=collate,
+        callbacks=callbacks,
     )
-    attention_mask = torch.nn.utils.rnn.pad_sequence(
-        [x["attention_mask"] for x in batch], batch_first=True, padding_value=0
-    )
-    labels         = torch.nn.utils.rnn.pad_sequence(
-        [x["labels"] for x in batch], batch_first=True, padding_value=-100
-    )
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
-# ─── Trainer ─────────────────────────────────────────────────────────
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=val_ds,
-    data_collator=collate,
-    callbacks=[
-        CSVLogger(),
-        SaveAdapter(),
-        StartEndNotify(),
-        RandomGenerateNotify(train_raw),
-        EarlyStoppingCallback(early_stopping_patience=EARLY_PATIENCE),
-    ],
-)
+    ckpt = None
+    if cfg.get("resume"):
+        ckpts = sorted(run_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+        ckpt = str(ckpts[-1]) if ckpts else None
+    notify(cfg.get("notify_url", ""), f"Train start: {run_dir.name} (resume={bool(ckpt)})")
+    trainer.train(resume_from_checkpoint=ckpt)
+    notify(cfg.get("notify_url", ""), "Train finished")
 
-# ─── Run ─────────────────────────────────────────────────────────────
-ckpts = sorted(
-    OUT_DIR.glob("checkpoint-*"),
-    key=lambda p: int(p.name.split("-")[-1]),
-)
-resume_ckpt = str(ckpts[-1]) if ckpts else None
-if resume_ckpt and not Path(resume_ckpt).exists():
-    resume_ckpt = None
+    adapter_dir = run_dir / "final_adapter"
+    model.save_pretrained(adapter_dir)
+    tokenizer.save_pretrained(adapter_dir)
+    logging.info("Adapter saved to %s", adapter_dir)
 
-notify(f"Resume {resume_ckpt}" if resume_ckpt else "New run")
-trainer.train(resume_from_checkpoint=resume_ckpt)
+    if cfg.get("save_merged") and not cfg.get("use_4bit"):
+        merged_dir = run_dir / "merged_model"
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_dir, safe_serialization=True)
+        tokenizer.save_pretrained(merged_dir)
+        logging.info("Merged model saved to %s", merged_dir)
 
-# ─── Save final adapter ──────────────────────────────────────────────
-adapter_dir = OUT_DIR / "final_adapter"
-model.save_pretrained(adapter_dir)
-tokenizer.save_pretrained(adapter_dir)
-logging.info(f"Adapter saved to {adapter_dir}")
-notify("🎉 Финальный адаптер сохранён")
+
+if __name__ == "__main__":
+    main()

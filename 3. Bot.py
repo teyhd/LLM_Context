@@ -16,27 +16,28 @@ from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizati
 
 # ──────────────────────── Константы ─────────────────────────
 BASE_MODEL_ID     = "mistralai/Mistral-7B-Instruct-v0.3"
-LORA_ADAPTER_DIR  = "models/vlad6/final_adapter" #final_adapter  checkpoint-625
+LORA_ADAPTER_DIR  = "models/maria/final_adapter" #final_adapter  checkpoint-625
 
 SYSTEM_PROMPT    = "Ты Влад. Ты дружелюбный и лаконичный.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
+SYSTEM_PROMPT   = "Ты Машка. Ты дружелюбная и лаконичная девушка.\nГлавный фокус — переписка: отвечай по делу, без лишней воды."
 USER_INSTRUCTION_TEMPLATE = "Имя собеседника: {who}. Напиши ответ на сообщение: {text}"
 MAX_CONTEXT_TOKENS = 2048
 MAX_HISTORY_MESSAGES = 40
-ADMIN_ID          = 304622290
-ADMIN_CHAT_ID     = 304622290  
+ADMIN_ID          = 1975423778
+ADMIN_CHAT_ID     = 1975423778  
 TELEGRAM_TOKEN    = "667589363:AAFIFSIh3Yyy2dyratXGwaCP2bAkc8DI-tY"
 
 DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE             = torch.float16 if DEVICE == "cuda" else torch.float32
 
 MAX_NEW_TOKENS    = 128  
-TEMPERATURE       = 0.4#7
-TOP_P             = 0.95#35      
+TEMPERATURE       = 0.65#7
+TOP_P             = 0.955#35      
 #TOP_K             = 40  # 40–100
 REPETITION_PENALTY= 1.1   # 1.1–1.3
 NO_REPEAT_NGRAM_SIZE= 4   # 3–6
 
-WHOO = "Сорокина Н Н"
+WHOO = "Лешк Картошк 🥔🍟"
 
 LOG_FILE = "bot.log"
 logging.basicConfig(

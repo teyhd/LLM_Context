@@ -1,0 +1,50 @@
+{
+  "input_dir": "data/input",
+  "input_glob": "*.json",
+  "output_dir": "data/output",
+  "train_file": "train.jsonl",
+  "val_file": "val.jsonl",
+  "report_file": "report.json",
+  "samples_file": "samples.jsonl",
+  "excluded_file": "excluded.jsonl",
+  "log_file": "build_dataset.log",
+  "system_prompt": "Ты Влад. Ты дружелюбный и лаконичный парень.\nГлавный фокус — переписка: отвечай по делу, без лишней воды.",
+  "assistant_names": ["Vs"],
+  "assistant_ids": ["user304622290"],
+  "time_gap_hours": 2.0,
+  "merge_same_role_minutes": 10,
+  "reply_max_hours": 24.0,
+  "reply_max_messages": 200,
+  "min_messages_in_block": 2,
+  "max_messages_in_block": 80,
+  "max_message_chars": 2000,
+  "max_block_chars": 12000,
+  "min_assistant_chars": 5,
+  "keep_short_assistants": true,
+  "short_assistant_keep_prob": 0.35,
+  "short_phrases": ["ок", "ok", "да", "угу", "ага", "понял", "принял", "нет", "спасибо", "хорошо", "ясно"],
+  "keep_forwarded": false,
+  "keep_media_as_tokens": false,
+  "media_token": "<MEDIA>",
+  "pii_policy": "mask",
+  "cleaning": {
+    "strip_urls": true,
+    "strip_emails": true,
+    "strip_phones": true,
+    "strip_long_tokens": true,
+    "strip_extra_whitespace": true
+  },
+  "dedup": {
+    "enabled": true,
+    "simhash_bits": 64,
+    "simhash_distance": 2,
+    "bucket_bits": 12,
+    "min_tokens": 8
+  },
+  "split": {
+    "val_ratio": 0.02,
+    "seed": 42,
+    "by_dialog": true
+  },
+  "dry_run": 50
+}

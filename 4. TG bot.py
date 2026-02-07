@@ -35,7 +35,6 @@ MIN_CONFIDENCE = float(os.getenv("min_confidence") or "0.25")
 ADMIN_ID = int(os.getenv("admin_id") or "304622290")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-COUNT = 0
 STOPED = False
 @dataclass
 class RuntimeParams:
@@ -298,6 +297,7 @@ def llm_answer(chat_id: int, text: str, who: str) -> tuple[str, float]:
     if "ахах" in answer:
         return llm_answer(chat_id, text, who)
     DIALOGS[chat_id].append({"role": "assistant", "content": answer})
+    print(f"\n\ninput: {text}\noutput: {answer}\nprop: {confidence}")
     trim_history(chat_id)
     return answer, confidence
 # ───────────────────────────── TELETHON USERBOT ─────────────────────────────
@@ -381,6 +381,7 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
             "/who <Имя> — закрепить WHOO (admin)\n"
             "/who — снять закрепление WHOO (admin)\n"
             "/reload_lora <path> — перезагрузить LoRA (admin)\n"
+            "/folder — обновить папку (admin)\n"
             "/clear — очистить историю этого чата (admin)\n",
             "/stop\n",
             "/bred\n",
@@ -450,10 +451,18 @@ async def handle_command(event: events.NewMessage.Event, text: str) -> bool:
         except Exception as e:
             await reply_safe(event, f"Ошибка reload_lora: {e}")
         return True
+    if cmd == "/folder":
+        global target_chat_ids
+        try:
+            target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
+            await reply_safe(event, f"Папка обновлена: {len(target_chat_ids)} чатов.")
+        except Exception as e:
+            await reply_safe(event, f"Ошибка обновления фильтра: {e}")
+        return True
     return False
 @client.on(events.NewMessage)
 async def on_new_message(event: events.NewMessage.Event):
-    global target_chat_ids, COUNT
+    global target_chat_ids
     if event.out:
         return
     chat_id = event.chat_id
@@ -494,9 +503,6 @@ async def on_new_message(event: events.NewMessage.Event):
         return
     log_msg(chat_id, sender_id, who, "OUT", f"[conf={confidence:.3f}] {answer}")
     await reply_safe(event, answer)
-    COUNT = COUNT + 1
-    if COUNT % 2 == 0:
-        target_chat_ids = await load_filter_chat_ids(TARGET_FILTER_ID)
 async def main():
     # 1) модель
     load_llm(P.lora_adapter_dir)

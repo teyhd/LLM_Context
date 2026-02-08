@@ -70,7 +70,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "media_token": "<MEDIA>",
     "use_user_name_template": True,
     "user_instruction_template": "Имя собеседника: {who}. Напиши ответ на сообщение: {text}",
-    "pii_policy": "mask",  # mask | drop
+    "pii_policy": "keep",  # keep | drop
     "cleaning": {
         "strip_urls": True,
         "strip_emails": True,

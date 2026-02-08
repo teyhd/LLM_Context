@@ -10,8 +10,12 @@
   "log_file": "build_dataset.log",
   "prompt_config": "config/prompt_config.json",
   "system_prompt": "Ты Влад. Ты дружелюбный и лаконичный парень.\nГлавный фокус — переписка: отвечай по делу, без лишней воды.",
-  "assistant_names": ["Vs"],
-  "assistant_ids": ["user304622290"],
+  "assistant_names": [
+    "Vs"
+  ],
+  "assistant_ids": [
+    "user304622290"
+  ],
   "time_gap_hours": 2.0,
   "merge_same_role_minutes": 10,
   "reply_max_hours": 24.0,
@@ -23,19 +27,31 @@
   "min_assistant_chars": 5,
   "keep_short_assistants": true,
   "short_assistant_keep_prob": 0.35,
-  "short_phrases": ["ок", "ok", "да", "угу", "ага", "понял", "принял", "нет", "спасибо", "хорошо", "ясно"],
+  "short_phrases": [
+    "ок",
+    "ok",
+    "да",
+    "угу",
+    "ага",
+    "понял",
+    "принял",
+    "нет",
+    "спасибо",
+    "хорошо",
+    "ясно"
+  ],
   "keep_forwarded": false,
   "keep_media_as_tokens": false,
   "media_token": "<MEDIA>",
   "use_user_name_template": true,
   "user_instruction_template": "Имя собеседника: {who}. Напиши ответ на сообщение: {text}",
-  "pii_policy": "mask",
+  "pii_policy": "keep",
   "cleaning": {
-    "strip_urls": true,
-    "strip_emails": true,
-    "strip_phones": true,
-    "strip_long_tokens": true,
-    "strip_extra_whitespace": true
+    "strip_urls": false,
+    "strip_emails": false,
+    "strip_phones": false,
+    "strip_long_tokens": false,
+    "strip_extra_whitespace": false
   },
   "dedup": {
     "enabled": true,
@@ -49,9 +65,9 @@
   "stride_tokens": 0,
   "stride_messages": 4,
   "split": {
-    "val_ratio": 0.02,
+    "val_ratio": 0.05,
     "seed": 42,
     "by_dialog": true
   },
-  "dry_run": 50
+  "dry_run": 0
 }

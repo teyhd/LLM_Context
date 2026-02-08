@@ -7,13 +7,14 @@
   "output_dir": "models",
   "run_name": "vlad",
   "run_dir": "",
-  "resume": true,
+  "resume": false,
+  "resume_optimizer": true,
   "seed": 42,
   "num_epochs": 3,
   "per_device_train_batch_size": 1,
   "per_device_eval_batch_size": 2,
   "gradient_accumulation_steps": 16,
-  "learning_rate": 1e-4,
+  "learning_rate": 0.0001,
   "warmup_ratio": 0.05,
   "weight_decay": 0.01,
   "max_seq_len": 2048,
@@ -35,11 +36,11 @@
   "lora_r": 16,
   "lora_alpha": 32,
   "lora_dropout": 0.05,
-  "lora_target_modules": "auto",
-  "save_steps": 200,
+  "lora_target_modules": "full",
+  "save_steps": 25,
   "eval_steps": 200,
   "save_total_limit": 4,
-  "logging_steps": 10,
+  "logging_steps": 25,
   "early_stopping_patience": 20,
   "report_to": [],
   "optim": "auto",
@@ -54,8 +55,45 @@
   "assistant_turns": "last",
   "max_samples_per_dialog": 0,
   "notify_url": "http://home.teyhd.ru:3334/",
-  "notify_interval": 50,
-  "notify_sample_interval": 500,
+  "notify_interval": 25,
+  "notify_sample_interval": 25,
+  "notify_sample_do_sample": false,
+  "notify_dialog_interval": 25,
+  "notify_dialogs": [
+    [
+      {
+        "role": "user",
+        "content": "Имя собеседника: Алиса Юрьевна. Напиши ответ на сообщение: Влад, это Алиса, только что отвела к тебе детей, Резников Макар не будет на программировании вообще, перешёл на медиа профиль"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Алиса Юрьевна. Напиши ответ на сообщение: Влад, привет) а ты приведешь 10 класс в школу?"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Алиса Юрьевна. Напиши ответ на сообщение: Влад, а ты приведёшь 9-10 класс?\nТам в студии еще 2 человека 🥺"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Алиса Юрьевна. Напиши ответ на сообщение: Влад, в 14 ждёт Святогор\nТы где? 🥺"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Сорокина Н Н. Напиши ответ на сообщение: Да. Это моя песня\nГде вы катаетесь?"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Сорокина Н Н. Напиши ответ на сообщение: Ты где?"
+      },
+      {
+        "role": "user",
+        "content": "Имя собеседника: Сорокина Н Н. Напиши ответ на сообщение: Когда домой?"
+      }
+    ]
+  ],
+  "notify_dialog_turns": 6,
   "save_merged": false,
-  "sanity_dialogs": []
+  "sanity_dialogs": [],
+  "alert_loss_spike_ratio": 1.5,
+  "alert_grad_norm": 10.0
 }

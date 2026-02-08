@@ -53,6 +53,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "run_name": "vlad",
     "run_dir": "",
     "resume": True,
+    "resume_optimizer": True,
     "seed": 42,
     "num_epochs": 2,
     "per_device_train_batch_size": 2,
@@ -89,10 +90,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "up_proj",
         "down_proj",
     ],
-    "save_steps": 200,
-    "eval_steps": 200,
+    "save_steps": 25,
+    "eval_steps": 25,
     "save_total_limit": 4,
-    "logging_steps": 10,
+    "logging_steps": 25,
     "early_stopping_patience": 20,
     "report_to": [],
     "optim": "auto",
@@ -107,8 +108,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "assistant_turns": "last",  # all | last
     "max_samples_per_dialog": 0,
     "notify_url": "",
-    "notify_interval": 50,
-    "notify_sample_interval": 500,
+    "notify_interval": 25,
+    "notify_sample_interval": 25,
+    "notify_sample_do_sample": False,
+    "notify_dialog_interval": 25,
+    "notify_dialogs": [],
+    "notify_dialog_turns": 4,
+    "alert_loss_spike_ratio": 1.5,
+    "alert_grad_norm": 10.0,
     "save_merged": False,
     "sanity_dialogs": [],
 }
@@ -151,6 +158,23 @@ def deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]
         else:
             base[key] = value
     return base
+
+
+def load_env_file(path: str = ".env") -> None:
+    p = Path(path)
+    if not p.exists():
+        return
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip().strip("\"'")  # simple .env format
+        if key and key not in os.environ:
+            os.environ[key] = val
 
 
 def load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -280,9 +304,16 @@ def notify(url: str, msg: str) -> None:
     if not url:
         return
     try:
-        import requests
+        try:
+            import requests
+            requests.get(url, params={"msg": msg[:1000]}, timeout=5)
+        except Exception:
+            import urllib.parse
+            import urllib.request
 
-        requests.get(url, params={"msg": msg[:1000]})
+            q = urllib.parse.urlencode({"msg": msg[:1000]})
+            with urllib.request.urlopen(f"{url}?{q}", timeout=5):
+                pass
     except Exception as e:  # noqa: BLE001
         logging.warning("notify failed: %s", e)
 
@@ -369,6 +400,14 @@ def normalize_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         cleaned.pop(0)
 
     return cleaned
+
+
+def clean_text(text: str, max_len: int) -> str:
+    if not text:
+        return ""
+    filtered = "".join(ch if ch.isprintable() else " " for ch in text)
+    filtered = " ".join(filtered.split())
+    return filtered[:max_len]
 
 
 def build_prompt(
@@ -549,7 +588,9 @@ def build_trainer(
     callbacks: List[TrainerCallback] = [
         CSVLogger(run_dir / "metrics.csv"),
         SaveAdapterCallback(),
-        NotifyLogger(cfg.get("notify_url", ""), cfg.get("notify_interval", 50)),
+        NotifyLogger(cfg.get("notify_url", ""), cfg.get("notify_interval", 50), cfg),
+        EvalPPLCallback(),
+        EvalNotifyCallback(cfg.get("notify_url", "")),
     ]
     callbacks.append(
         DatasetSampleNotify(
@@ -574,6 +615,8 @@ def build_trainer(
                 cfg.get("notify_url", ""),
             )
         )
+    if cfg.get("notify_dialog_interval", 0) > 0 and cfg.get("notify_dialogs"):
+        callbacks.append(MultiTurnNotifyCallback(tokenizer, cfg, cfg.get("notify_url", "")))
 
     trainer = Trainer(
         model=model,
@@ -683,12 +726,15 @@ class CSVLogger(TrainerCallback):
 
 
 class NotifyLogger(TrainerCallback):
-    def __init__(self, url: str, interval: int):
+    def __init__(self, url: str, interval: int, cfg: Dict[str, Any]):
         self.url = url
         self.interval = max(1, int(interval or 0))
+        self.cfg = cfg
         self.start_time = None
         self.last_time = None
         self.last_step = 0
+        self.loss_ema = None
+        self.last_loss = None
 
     def _format_eta(self, seconds: float) -> str:
         if seconds <= 0:
@@ -739,17 +785,105 @@ class NotifyLogger(TrainerCallback):
             eta_text,
             self._vram_text(),
         ]
-        for key in ("loss", "eval_loss", "learning_rate"):
+        loss = logs.get("loss")
+        prev_loss = self.last_loss
+        grad_norm = logs.get("grad_norm")
+        lr = logs.get("learning_rate")
+        epoch = logs.get("epoch", state.epoch)
+
+        if isinstance(loss, (int, float)):
+            self.loss_ema = loss if self.loss_ema is None else (0.9 * self.loss_ema + 0.1 * float(loss))
+            self.last_loss = float(loss)
+
+        for key in ("loss", "eval_loss", "eval_ppl", "learning_rate", "grad_norm"):
             if key in logs:
                 val = logs[key]
+                if isinstance(val, float):
+                    if key == "learning_rate":
+                        parts.append(f"{key}={val:.2e}")
+                    elif key == "grad_norm":
+                        parts.append(f"{key}={val:.2f}")
+                    else:
+                        parts.append(f"{key}={val:.4f}")
+                else:
+                    parts.append(f"{key}={val}")
+        if self.loss_ema is not None:
+            parts.append(f"loss_ema={self.loss_ema:.4f}")
+        if epoch is not None:
+            parts.append(f"epoch={epoch:.3f}")
+
+        notify(self.url, " | ".join(parts))
+        self._maybe_alerts(loss, grad_norm, prev_loss)
+        self.last_time = now
+        self.last_step = state.global_step
+
+    def _maybe_alerts(self, loss, grad_norm, prev_loss):
+        if not self.url:
+            return
+        if isinstance(loss, float) and (math.isnan(loss) or math.isinf(loss)):
+            notify(self.url, "[ALERT] loss is NaN/Inf")
+        if isinstance(grad_norm, float) and (math.isnan(grad_norm) or math.isinf(grad_norm)):
+            notify(self.url, "[ALERT] grad_norm is NaN/Inf")
+        spike_ratio = float(self.cfg.get("alert_loss_spike_ratio", 1.5))
+        grad_thresh = float(self.cfg.get("alert_grad_norm", 10.0))
+        if prev_loss and isinstance(loss, (int, float)):
+            if loss > prev_loss * spike_ratio:
+                notify(self.url, f"[WARN] loss spike: {loss:.4f} > {spike_ratio}x prev")
+        if isinstance(grad_norm, (int, float)) and grad_norm > grad_thresh:
+            notify(self.url, f"[WARN] grad_norm high: {grad_norm:.2f} > {grad_thresh}")
+
+
+class EvalPPLCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, metrics=None, **kw):
+        if not metrics:
+            return
+        eval_loss = metrics.get("eval_loss")
+        prev_eval = None
+        if isinstance(eval_loss, (int, float)) and eval_loss > 0:
+            metrics["eval_ppl"] = math.exp(float(eval_loss))
+
+
+class EvalNotifyCallback(TrainerCallback):
+    def __init__(self, url: str):
+        self.url = url
+        self.last_eval_loss = None
+        self.worse_streak = 0
+        self.best_eval_loss = None
+
+    def on_evaluate(self, args, state, control, metrics=None, **kw):
+        if not self.url or not metrics:
+            return
+        parts = [f"[EVAL step {state.global_step}]"]
+        eval_loss = metrics.get("eval_loss")
+        prev_eval = None
+        if isinstance(eval_loss, (int, float)):
+            prev_eval = self.last_eval_loss
+            if self.best_eval_loss is None or eval_loss < self.best_eval_loss:
+                self.best_eval_loss = float(eval_loss)
+            if prev_eval is not None and eval_loss > prev_eval:
+                self.worse_streak += 1
+            else:
+                self.worse_streak = 0
+            self.last_eval_loss = float(eval_loss)
+
+            if self.worse_streak >= 2:
+                notify(self.url, f"[WARN] eval_loss worsens {self.worse_streak + 1} consecutive evals")
+
+        if self.best_eval_loss is not None:
+            parts.append(f"best_eval_loss={self.best_eval_loss:.4f}")
+        if isinstance(eval_loss, (int, float)) and prev_eval is not None:
+            parts.append(f"delta_eval={eval_loss - prev_eval:+.4f}")
+
+        for key in ("eval_loss", "eval_ppl", "learning_rate"):
+            if key in metrics:
+                val = metrics[key]
                 if isinstance(val, float):
                     parts.append(f"{key}={val:.4f}" if key != "learning_rate" else f"{key}={val:.2e}")
                 else:
                     parts.append(f"{key}={val}")
-
+        if "epoch" in metrics:
+            parts.append(f"epoch={metrics['epoch']}")
         notify(self.url, " | ".join(parts))
-        self.last_time = now
-        self.last_step = state.global_step
 
 
 class DatasetSampleNotify(TrainerCallback):
@@ -759,6 +893,11 @@ class DatasetSampleNotify(TrainerCallback):
         self.data = data
         self.tokenizer = tokenizer
         self.cfg = cfg
+        self.model = None
+        self.sent = 0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.model = kwargs.get("model", None)
 
     def on_step_end(self, args, state, control, **kwargs):
         if not self.url or self.interval <= 0:
@@ -781,26 +920,40 @@ class DatasetSampleNotify(TrainerCallback):
         if not prompt:
             return
 
-        model = kwargs.get("model")
+        model = kwargs.get("model") or self.model
         if model is None:
             return
 
         enc = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.cfg["max_seq_len"])
         enc = {k: v.to(model.device) for k, v in enc.items()}
-        with torch.no_grad():
-            out = model.generate(
-                **enc,
-                max_new_tokens=self.cfg.get("max_gen_tokens", 128),
-                do_sample=True,
-                temperature=self.cfg.get("temperature", 0.7),
-                top_p=self.cfg.get("top_p", 0.9),
-                repetition_penalty=self.cfg.get("repetition_penalty", 1.1),
-                no_repeat_ngram_size=self.cfg.get("no_repeat_ngram_size", 3),
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+        do_sample = bool(self.cfg.get("notify_sample_do_sample", False))
+        gen_kwargs = {
+            "max_new_tokens": self.cfg.get("max_gen_tokens", 128),
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.eos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "repetition_penalty": self.cfg.get("repetition_penalty", 1.1),
+            "no_repeat_ngram_size": self.cfg.get("no_repeat_ngram_size", 3),
+        }
+        if do_sample:
+            gen_kwargs.update(
+                {
+                    "temperature": self.cfg.get("temperature", 0.7),
+                    "top_p": self.cfg.get("top_p", 0.9),
+                }
             )
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            out = model.generate(**enc, **gen_kwargs)
+        if was_training:
+            model.train()
         gen = self.tokenizer.decode(out[0][enc["input_ids"].shape[-1]:], skip_special_tokens=True)
-        msg = f"[SAMPLE step {state.global_step}]\\nGOLD: {gold}\\nGEN: {gen}\\nPROMPT: {prompt}"
+        gen = clean_text(gen, 800)
+        gold = clean_text(gold, 800)
+        prompt = clean_text(prompt, 1200)
+        self.sent += 1
+        msg = f"[SAMPLE #{self.sent} step {state.global_step}]\\nGOLD: {gold}\\nGEN: {gen}\\nPROMPT: {prompt}"
         notify(self.url, msg)
 
 
@@ -853,6 +1006,74 @@ class SampleGenerateCallback(TrainerCallback):
         msg = f"[GEN step {state.global_step}]\\nPROMPT: {prompt}\\nGEN: {gen}"
         logging.info(msg)
         notify(self.notify_url, msg)
+
+
+class MultiTurnNotifyCallback(TrainerCallback):
+    def __init__(self, tokenizer, cfg: Dict[str, Any], notify_url: str):
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+        self.notify_url = notify_url
+        self.dialogs = cfg.get("notify_dialogs") or []
+        self.interval = int(cfg.get("notify_dialog_interval") or 0)
+        self.turns = int(cfg.get("notify_dialog_turns") or 4)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.notify_url or self.interval <= 0:
+            return
+        if state.global_step == 0 or state.global_step % self.interval != 0:
+            return
+        if not self.dialogs:
+            return
+        model = kwargs.get("model")
+        if model is None:
+            return
+
+        dialog = random.choice(self.dialogs)
+        history: List[Dict[str, str]] = []
+        transcript: List[str] = [f"[DIALOG step {state.global_step}]"]
+
+        was_training = model.training
+        model.eval()
+        for turn_idx, turn in enumerate(dialog[: self.turns]):
+            role = (turn.get("role") or "user").strip()
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "assistant":
+                history.append({"role": "assistant", "content": content})
+                transcript.append(f"A: {clean_text(content, 400)}")
+                continue
+
+            history.append({"role": "user", "content": content})
+            prompt = self.tokenizer.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
+            enc = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.cfg["max_seq_len"])
+            enc = {k: v.to(model.device) for k, v in enc.items()}
+            gen_kwargs = {
+                "max_new_tokens": self.cfg.get("max_gen_tokens", 128),
+                "do_sample": bool(self.cfg.get("notify_sample_do_sample", False)),
+                "pad_token_id": self.tokenizer.eos_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "repetition_penalty": self.cfg.get("repetition_penalty", 1.1),
+                "no_repeat_ngram_size": self.cfg.get("no_repeat_ngram_size", 3),
+            }
+            if gen_kwargs["do_sample"]:
+                gen_kwargs.update(
+                    {
+                        "temperature": self.cfg.get("temperature", 0.7),
+                        "top_p": self.cfg.get("top_p", 0.9),
+                    }
+                )
+            with torch.no_grad():
+                out = model.generate(**enc, **gen_kwargs)
+            gen = self.tokenizer.decode(out[0][enc["input_ids"].shape[-1]:], skip_special_tokens=True)
+            gen = clean_text(gen, 500)
+            transcript.append(f"U: {clean_text(content, 400)}")
+            transcript.append(f"A*: {gen}")
+            history.append({"role": "assistant", "content": gen})
+
+        if was_training:
+            model.train()
+        notify(self.notify_url, "\n".join(transcript))
 
 
 def run_sanity_checks(
@@ -911,7 +1132,16 @@ def main() -> None:
     parser.add_argument("--config", help="Path to JSON config", default=None)
     args = parser.parse_args()
 
+    load_env_file(".env")
+    if args.config is None:
+        default_cfg = Path("config/train_config.json")
+        if default_cfg.exists():
+            args.config = str(default_cfg)
+
     cfg = load_config(args.config)
+    env_notify = os.environ.get("NOTIFY_URL", "").strip()
+    if env_notify and not cfg.get("notify_url"):
+        cfg["notify_url"] = env_notify
     vram_gb, gpu_name = get_gpu_info()
     apply_profile(cfg, vram_gb)
     auto_configure(cfg, vram_gb)
@@ -928,6 +1158,28 @@ def main() -> None:
     if vram_gb:
         logging.info("GPU detected: %s (%.1f GB)", gpu_name, vram_gb)
     logging.info("Profile: %s | use_4bit=%s | max_seq_len=%s", cfg.get("profile"), cfg.get("use_4bit"), cfg.get("max_seq_len"))
+    logging.info(
+        "Training params: save_steps=%s | eval_steps=%s | logging_steps=%s | notify_interval=%s | notify_sample_interval=%s | notify_dialog_interval=%s",
+        cfg.get("save_steps"),
+        cfg.get("eval_steps"),
+        cfg.get("logging_steps"),
+        cfg.get("notify_interval"),
+        cfg.get("notify_sample_interval"),
+        cfg.get("notify_dialog_interval"),
+    )
+    logging.info(
+        "Model params: lr=%s | batch=%s | grad_accum=%s | max_seq_len=%s | lora_targets=%s | pack=%s",
+        cfg.get("learning_rate"),
+        cfg.get("per_device_train_batch_size"),
+        cfg.get("gradient_accumulation_steps"),
+        cfg.get("max_seq_len"),
+        cfg.get("lora_target_modules"),
+        cfg.get("pack_samples"),
+    )
+    if cfg.get("notify_url"):
+        logging.info("Notify enabled: %s", cfg["notify_url"])
+    else:
+        logging.warning("Notify URL not set; notifications will be skipped")
 
     with (run_dir / "train_config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
@@ -945,12 +1197,25 @@ def main() -> None:
     if cfg.get("resume"):
         ckpts = sorted(run_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
         ckpt = str(ckpts[-1]) if ckpts else None
+        if ckpt and not cfg.get("resume_optimizer", True):
+            for fname in ("optimizer.pt", "scheduler.pt"):
+                fpath = Path(ckpt) / fname
+                if fpath.exists():
+                    fpath.unlink()
+            logging.warning("Optimizer/scheduler state removed for resume: %s", ckpt)
 
     retries = int(cfg.get("oom_retries", 0))
     for attempt in range(retries + 1):
         trainer, train_ds, val_ds = build_trainer(cfg, run_dir, model, tokenizer, train_raw, val_raw)
         logging.info("Samples: %d train | %d val", len(train_ds), len(val_ds))
-        notify(cfg.get("notify_url", ""), f"Train start: {run_dir.name} (resume={bool(ckpt)})")
+        notify(
+            cfg.get("notify_url", ""),
+            (
+                f"Train start: {run_dir.name} (resume={bool(ckpt)}) | "
+                f"save_steps={cfg.get('save_steps')} | eval_steps={cfg.get('eval_steps')} | "
+                f"max_seq_len={cfg.get('max_seq_len')} | lora={cfg.get('lora_target_modules')}"
+            ),
+        )
         try:
             trainer.train(resume_from_checkpoint=ckpt)
             notify(cfg.get("notify_url", ""), "Train finished")
@@ -958,6 +1223,7 @@ def main() -> None:
         except RuntimeError as e:
             if "out of memory" in str(e).lower() and cfg.get("auto_oom_recovery") and attempt < retries:
                 logging.warning("OOM detected, attempting recovery: %s", e)
+                notify(cfg.get("notify_url", ""), "OOM detected, auto-recovery adjusting max_seq_len/grad_accum")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 cfg["max_seq_len"] = max(1024, int(cfg["max_seq_len"]) - 512)

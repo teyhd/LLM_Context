@@ -95,6 +95,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "save_total_limit": 4,
     "logging_steps": 25,
     "early_stopping_patience": 20,
+    "load_best_model_at_end": "auto",  # auto | true | false
+    "metric_for_best_model": "eval_loss",
+    "greater_is_better": False,
     "report_to": [],
     "optim": "auto",
     "group_by_length": True,
@@ -537,6 +540,28 @@ def build_trainer(
 
     eval_strategy = "steps" if len(val_ds) > 0 else "no"
     save_strategy = "steps" if cfg.get("save_steps") else "no"
+    eval_steps = int(cfg.get("eval_steps") or 0)
+    save_steps = int(cfg.get("save_steps") or 0)
+
+    cfg_load_best = cfg.get("load_best_model_at_end", "auto")
+    if isinstance(cfg_load_best, str) and cfg_load_best.lower() == "auto":
+        load_best = bool(len(val_ds))
+    elif isinstance(cfg_load_best, bool):
+        load_best = cfg_load_best
+    else:
+        load_best = bool(len(val_ds))
+
+    if load_best and eval_strategy == "steps" and save_strategy == "steps":
+        if eval_steps and save_steps and (save_steps % eval_steps != 0):
+            logging.warning(
+                "load_best_model_at_end disabled: save_steps=%s is not a multiple of eval_steps=%s",
+                save_steps,
+                eval_steps,
+            )
+            load_best = False
+    if load_best and eval_strategy == "no":
+        logging.warning("load_best_model_at_end disabled: no eval set")
+        load_best = False
 
     params = dict(
         output_dir=str(run_dir),
@@ -558,7 +583,9 @@ def build_trainer(
         save_strategy=save_strategy,
         save_steps=cfg["save_steps"],
         save_total_limit=cfg["save_total_limit"],
-        load_best_model_at_end=bool(len(val_ds)),
+        load_best_model_at_end=load_best,
+        metric_for_best_model=cfg.get("metric_for_best_model", "eval_loss") if load_best else None,
+        greater_is_better=cfg.get("greater_is_better", False) if load_best else None,
         group_by_length=cfg.get("group_by_length", True),
         optim=optim,
         report_to=cfg.get("report_to", []),
@@ -602,7 +629,10 @@ def build_trainer(
         )
     )
     if cfg.get("early_stopping_patience") and len(val_ds) > 0:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=cfg["early_stopping_patience"]))
+        if not load_best:
+            logging.warning("EarlyStopping disabled: load_best_model_at_end is off")
+        else:
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=cfg["early_stopping_patience"]))
 
     if cfg.get("generate_interval", 0) > 0 and cfg.get("sample_prompts"):
         callbacks.append(
@@ -1159,13 +1189,14 @@ def main() -> None:
         logging.info("GPU detected: %s (%.1f GB)", gpu_name, vram_gb)
     logging.info("Profile: %s | use_4bit=%s | max_seq_len=%s", cfg.get("profile"), cfg.get("use_4bit"), cfg.get("max_seq_len"))
     logging.info(
-        "Training params: save_steps=%s | eval_steps=%s | logging_steps=%s | notify_interval=%s | notify_sample_interval=%s | notify_dialog_interval=%s",
+        "Training params: save_steps=%s | eval_steps=%s | logging_steps=%s | notify_interval=%s | notify_sample_interval=%s | notify_dialog_interval=%s | load_best=%s",
         cfg.get("save_steps"),
         cfg.get("eval_steps"),
         cfg.get("logging_steps"),
         cfg.get("notify_interval"),
         cfg.get("notify_sample_interval"),
         cfg.get("notify_dialog_interval"),
+        cfg.get("load_best_model_at_end"),
     )
     logging.info(
         "Model params: lr=%s | batch=%s | grad_accum=%s | max_seq_len=%s | lora_targets=%s | pack=%s",

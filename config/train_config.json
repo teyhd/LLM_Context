@@ -95,5 +95,8 @@
   "save_merged": false,
   "sanity_dialogs": [],
   "alert_loss_spike_ratio": 1.5,
-  "alert_grad_norm": 10.0
+  "alert_grad_norm": 10.0,
+  "load_best_model_at_end": false,
+  "metric_for_best_model": "eval_loss",
+  "greater_is_better": false
 }

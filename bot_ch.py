@@ -33,15 +33,17 @@ def _env_bool(*names, default: bool = False) -> bool:
     return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 BASE_MODEL_ID     = _env_any("BASE_MODEL_ID", "base_model_id") or "mistralai/Mistral-7B-Instruct-v0.3"
-LORA_ADAPTER_DIR  = _env_any("LORA_ADAPTER_DIR", "lora_adapter_dir") or "models/vlad_20260208_104709/final_adapter"
+MODEL_DIR = _env_any("MODEL_DIR", "model_dir") or "models/vlad_20260208_104709"
+PRIMARY_ADAPTER = _env_any("PRIMARY_ADAPTER", "primary_adapter") or "final_adapter"
+LORA_ADAPTER_DIR  = _env_any("LORA_ADAPTER_DIR", "lora_adapter_dir")
 TRAIN_CONFIG_PATH = _env_any("TRAIN_CONFIG_PATH", "train_config_path")
+if not LORA_ADAPTER_DIR:
+    LORA_ADAPTER_DIR = str(Path(MODEL_DIR) / PRIMARY_ADAPTER)
 
 SYSTEM_PROMPT = _env_any("SYSTEM_PROMPT", "system_prompt")
 USER_INSTRUCTION_TEMPLATE = _env_any("USER_INSTRUCTION_TEMPLATE", "user_instruction_template")
 MAX_CONTEXT_TOKENS = _env_any("MAX_CONTEXT_TOKENS", "max_context_tokens")
 MAX_HISTORY_MESSAGES = int(_env_any("MAX_HISTORY_MESSAGES", "max_history_messages") or "40")
-GPU_MEM_RESERVE_MB = int(_env_any("GPU_MEM_RESERVE_MB", "gpu_mem_reserve_mb") or "1024")
-USE_AUTO_DEVICE_MAP = _env_bool("USE_AUTO_DEVICE_MAP", "use_auto_device_map", default=False)
 ADMIN_ID          = int(_env_any("ADMIN_ID", "admin_id") or "304622290")
 ADMIN_CHAT_ID     = int(_env_any("ADMIN_CHAT_ID", "admin_chat_id") or "304622290")
 TELEGRAM_TOKEN    = _env_any("TELEGRAM_TOKEN", "telegram_token") or "667589363:AAFIFSIh3Yyy2dyratXGwaCP2bAkc8DI-tY"
@@ -59,7 +61,7 @@ if os.path.exists(PROMPT_CONFIG_PATH):
 def _instruction_prefix(template: str) -> str:
     if "{who}" in template:
         return template.split("{who}", 1)[0].strip()
-    return "Имя собеседника:"
+    return "\u0418\u043c\u044f \u0441\u043e\u0431\u0435\u0441\u0435\u0434\u043d\u0438\u043a\u0430:"
 
 INSTR_PREFIX = _instruction_prefix(USER_INSTRUCTION_TEMPLATE)
 
@@ -73,9 +75,9 @@ REPETITION_PENALTY= _env_any("REPETITION_PENALTY", "repetition_penalty")
 NO_REPEAT_NGRAM_SIZE= _env_any("NO_REPEAT_NGRAM_SIZE", "no_repeat_ngram_size")
 DO_SAMPLE        = _env_bool("DO_SAMPLE", "do_sample", default=False)
 
-WHOO = _env_any("DEFAULT_WHO", "who") or "Алиса Юрьевна"
+WHOO = _env_any("DEFAULT_WHO", "who") or "\u0410\u043b\u0438\u0441\u0430 \u042e\u0440\u044c\u0435\u0432\u043d\u0430"
 
-LOG_FILE = "bot.log"
+LOG_FILE = "bot_ch.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -106,23 +108,35 @@ def gpu_info() -> str:
     except Exception as e:
         return f"NVML-ошибка: {e}"
 
-def gpu_mem_mb() -> tuple[int, int] | None:
-    if DEVICE != "cuda":
-        return None
-    try:
-        nvmlInit()
-        h = nvmlDeviceGetHandleByIndex(0)
-        mem = nvmlDeviceGetMemoryInfo(h)
-        nvmlShutdown()
-        mb = lambda x: int(x / 2**20)
-        return mb(mem.total), mb(mem.free)
-    except Exception:
-        return None
-
 def safe_send(bot: TeleBot, chat_id: int, text: str, *args, **kw):
     """Делит длинный текст на части ≤ 4096 симв. (без Markdown)."""
     for chunk in (text[i:i+4000] for i in range(0, len(text), 4000)):
         bot.send_message(chat_id, chunk, *args, **kw)
+
+def list_adapter_dirs(model_dir: str, fallback_adapter: str | None = None) -> list[tuple[str, Path]]:
+    base = Path(model_dir)
+    adapters: list[tuple[str, Path]] = []
+    final_dir = base / "final_adapter"
+    if final_dir.exists():
+        adapters.append(("final_adapter", final_dir))
+    def _ckpt_key(path: Path):
+        name = path.name
+        try:
+            return int(name.split("-")[-1])
+        except Exception:
+            return name
+
+    for ckpt in sorted(base.glob("checkpoint-*"), key=_ckpt_key):
+        adapter_dir = ckpt / "adapter"
+        if adapter_dir.exists():
+            adapters.append((ckpt.name, adapter_dir))
+    if not adapters and fallback_adapter:
+        p = Path(fallback_adapter)
+        if p.exists():
+            name = p.parent.name if p.name == "adapter" else p.name
+            adapters.append((name, p))
+    return adapters
+
 
 # ─────────────────── Загрузка модели ────────────────────────
 # Model loading
@@ -132,6 +146,10 @@ def _resolve_train_config_path() -> Path | None:
         p = Path(TRAIN_CONFIG_PATH)
         return p if p.exists() else None
     try:
+        model_dir = Path(MODEL_DIR)
+        candidate = model_dir / "train_config.json"
+        if candidate.exists():
+            return candidate
         lora_dir = Path(LORA_ADAPTER_DIR)
         candidate = lora_dir.parent / "train_config.json"
         return candidate if candidate.exists() else None
@@ -173,15 +191,20 @@ NO_REPEAT_NGRAM_SIZE = int(NO_REPEAT_NGRAM_SIZE or "3")
 tokenizer = None
 base_model = None
 model = None
+ADAPTER_ORDER: list[str] = []
+PRIMARY_ADAPTER_DISPLAY = None
+DISPLAY_TO_MODEL: dict[str, str] = {}
 
-def _tokenizer_source(lora_dir: Path) -> str:
-    for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json"):
-        if (lora_dir / name).exists():
-            return str(lora_dir)
+def _tokenizer_source() -> str:
+    final_dir = Path(MODEL_DIR) / "final_adapter"
+    for base in (final_dir, Path(LORA_ADAPTER_DIR)):
+        for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json"):
+            if (base / name).exists():
+                return str(base)
     return BASE_MODEL_ID
 
-def load_llm(lora_dir: str) -> None:
-    global tokenizer, base_model, model, USE_AUTO_DEVICE_MAP
+def load_llm() -> None:
+    global tokenizer, base_model, model, ADAPTER_ORDER, PRIMARY_ADAPTER_DISPLAY, DISPLAY_TO_MODEL
     with contextlib.suppress(Exception):
         if model is not None:
             del model
@@ -193,55 +216,54 @@ def load_llm(lora_dir: str) -> None:
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
 
-    lora_path = Path(lora_dir)
-    if not lora_path.exists():
-        raise RuntimeError(f"LoRA adapter not found: {lora_path}")
+    adapter_entries = list_adapter_dirs(MODEL_DIR, LORA_ADAPTER_DIR)
+    if not adapter_entries:
+        raise RuntimeError(f"No adapters found in {MODEL_DIR!r} and LORA_ADAPTER_DIR={LORA_ADAPTER_DIR!r}")
 
     print("Loading tokenizer...")
-    tokenizer_src = _tokenizer_source(lora_path)
+    tokenizer_src = _tokenizer_source()
     tokenizer_local = AutoTokenizer.from_pretrained(tokenizer_src, use_fast=False)
     if tokenizer_local.pad_token_id is None:
         tokenizer_local.pad_token = tokenizer_local.eos_token
-
-    device_map = {"": DEVICE}
-    max_memory = None
-    if DEVICE == "cuda":
-        mem = gpu_mem_mb()
-        if mem:
-            total_mb, free_mb = mem
-            if free_mb < max(GPU_MEM_RESERVE_MB * 2, 2048):
-                USE_AUTO_DEVICE_MAP = True
-        if USE_AUTO_DEVICE_MAP:
-            if mem:
-                total_mb, _ = mem
-                avail_mb = max(total_mb - GPU_MEM_RESERVE_MB, 1024)
-                max_memory = {"cuda:0": f"{avail_mb}MB", "cpu": "48GB"}
-            device_map = "auto"
 
     print(f"Loading base model: {BASE_MODEL_ID} ({DEVICE}/{DTYPE})")
     base_local = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         dtype=DTYPE,
-        device_map=device_map,
-        max_memory=max_memory,
+        device_map={"": DEVICE},
         low_cpu_mem_usage=True,
     )
     base_local.resize_token_embeddings(len(tokenizer_local))
 
-    print(f"Loading LoRA adapter: {lora_path}")
-    peft_kwargs = {"dtype": DTYPE, "device_map": device_map}
-    if max_memory:
-        peft_kwargs["max_memory"] = max_memory
-    model_local = PeftModel.from_pretrained(base_local, str(lora_path), **peft_kwargs)
+    first_name, first_path = adapter_entries[0]
+    print(f"Loading LoRA adapter: {first_path}")
+    model_local = PeftModel.from_pretrained(
+        base_local,
+        str(first_path),
+        dtype=DTYPE,
+        device_map={"": DEVICE},
+    )
+    display_to_model = {first_name: "default"}
+    for name, path in adapter_entries[1:]:
+        model_local.load_adapter(str(path), adapter_name=name)
+        display_to_model[name] = name
+
+    primary = PRIMARY_ADAPTER or adapter_entries[0][0]
+    if primary not in display_to_model:
+        primary = adapter_entries[0][0]
+    model_local.set_adapter(display_to_model[primary])
     model_local.eval()
 
     tokenizer = tokenizer_local
     base_model = base_local
     model = model_local
+    ADAPTER_ORDER = [name for name, _ in adapter_entries]
+    PRIMARY_ADAPTER_DISPLAY = primary
+    DISPLAY_TO_MODEL = display_to_model
     print("Ready.")
 
 # Model initialization
-load_llm(LORA_ADAPTER_DIR)
+load_llm()
 
 _gen_kwargs = dict(
     max_new_tokens=MAX_NEW_TOKENS,
@@ -340,6 +362,16 @@ def log_context(uid: int, who: str, history: list[dict], prompt: str, prompt_tok
         logging.warning("log_context failed: %s", e)
 
 @torch.inference_mode()
+def _generate_from_prompt(prompt_ids: list[int]) -> str:
+    inputs = {
+        "input_ids": torch.tensor([prompt_ids], device=model.device),
+        "attention_mask": torch.ones(1, len(prompt_ids), device=model.device),
+    }
+    output_ids = model.generate(**inputs, generation_config=GEN_CFG)[0]
+    answer_ids = output_ids[len(prompt_ids):]
+    return tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+
+@torch.inference_mode()
 def llm_answer(user_id: int, text: str, who: str) -> str:
     if user_id not in DIALOGS:
         reset_dialog(user_id)
@@ -347,9 +379,8 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
     history = trim_history(user_id)
     chat_ctx = build_chat_messages(history, who)
     if not chat_ctx:
-        return "История пуста, отправьте сообщение ещё раз."
+        return "??????? ?????, ????????? ????????? ??? ???."
 
-    # Строим prompt как в обучении и вручную обрезаем историю справа, чтобы не терять свежий контекст
     prompt_text = tokenizer.apply_chat_template(
         chat_ctx,
         tokenize=False,
@@ -363,21 +394,31 @@ def llm_answer(user_id: int, text: str, who: str) -> str:
         prompt_ids = prompt_ids[-MAX_CONTEXT_TOKENS:]
         prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
-    inputs = {
-        "input_ids": torch.tensor([prompt_ids], device=model.device),
-        "attention_mask": torch.ones(1, len(prompt_ids), device=model.device),
-    }
     log_context(user_id, who, history, prompt_text, len(prompt_ids))
 
-    output_ids = model.generate(**inputs, generation_config=GEN_CFG)[0]
-    answer_ids = output_ids[len(prompt_ids):]
-    answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-    DIALOGS[user_id].append({"role": "assistant", "content": answer})
-    trim_history(user_id)
-    logging.info("ANSWER uid=%s len=%d text=%s", user_id, len(answer), answer)
-    return answer
+    answers: list[tuple[str, str]] = []
+    primary_answer: str | None = None
+    for display_name in ADAPTER_ORDER:
+        adapter_name = DISPLAY_TO_MODEL.get(display_name)
+        if not adapter_name:
+            continue
+        model.set_adapter(adapter_name)
+        answer = _generate_from_prompt(prompt_ids)
+        answers.append((display_name, answer))
+        if display_name == PRIMARY_ADAPTER_DISPLAY:
+            primary_answer = answer
+        logging.info("ANSWER adapter=%s uid=%s len=%d text=%s", display_name, user_id, len(answer), answer)
 
-# ──────────────── Обработчики команд ────────────────────────
+    if primary_answer is None and answers:
+        primary_answer = answers[0][1]
+    if primary_answer:
+        DIALOGS[user_id].append({"role": "assistant", "content": primary_answer})
+        trim_history(user_id)
+
+    if not answers:
+        return "Ответов не получено."
+    return "\n\n".join([f"{name}\nОтвет: {ans}" for name, ans in answers])
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_help(msg):
     safe_send(bot, msg.chat.id,
